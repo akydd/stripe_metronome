@@ -1,4 +1,4 @@
-// Command metronome runs the Metronome metering service.
+// Command metering runs the metering service (the Metronome integration).
 package main
 
 import (
@@ -12,7 +12,7 @@ import (
 	"github.com/akydd/stripe_metronome/internal/app"
 	"github.com/akydd/stripe_metronome/internal/config"
 	"github.com/akydd/stripe_metronome/internal/events"
-	"github.com/akydd/stripe_metronome/internal/metronome"
+	"github.com/akydd/stripe_metronome/internal/metering"
 )
 
 func main() {
@@ -21,8 +21,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	cfg := config.Load("METRONOME", ":8082")
-	bus, err := events.NewBus(cfg.BusKind, cfg.KafkaSeeds, "metronome", log)
+	cfg := config.Load("METERING", ":8082")
+	bus, err := events.NewBus(cfg.BusKind, cfg.KafkaSeeds, "metering", log)
 	if err != nil {
 		log.Error("failed to create event bus", "err", err)
 		os.Exit(1)
@@ -30,9 +30,9 @@ func main() {
 	defer bus.Close()
 
 	mux := http.NewServeMux()
-	metronome.New(cfg, bus, log).Register(mux)
+	metering.New(cfg, bus, log).Register(mux)
 
-	if err := app.Serve(ctx, "metronome", cfg.HTTPAddr, log, mux); err != nil {
+	if err := app.Serve(ctx, "metering", cfg.HTTPAddr, log, mux); err != nil {
 		log.Error("service exited with error", "err", err)
 		os.Exit(1)
 	}

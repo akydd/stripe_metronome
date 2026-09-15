@@ -15,7 +15,7 @@ bus (`internal/events`) — never by calling another service directly.
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping), the billing-cycle boundary (`billing_cycle.ended`), and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
 | `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and flat-fee subscriptions** (`subscription.activated`/`cancelled`). On `billing_cycle.ended`, queries Metronome for usage, creates the invoice (usage items + active subscription fees), maps the payment outcome onto the bus. Calls `STRIPE_BASE_URL` + `METRONOME_SERVICE_URL`. |
-| `metronome` | `cmd/metronome`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
+| `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs) mirror real endpoints. `close-period` is a **demo shim** (real Metronome has no such call). Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
 | `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for *generator processes* (`/v1/generators`). Two types: **usage** (ticks → publishes `usage.ingested`) and **subscription** (flat fee; start/stop → `subscription.activated`/`cancelled`). Frontend calls it directly. |
@@ -26,7 +26,7 @@ Override a listen address with `<SERVICE>_HTTP_ADDR` (e.g. `BILLING_HTTP_ADDR`).
 
 Services publish/subscribe to domain events (each event type is a Kafka topic).
 Reads (mid-cycle preview, invoice history) are synchronous HTTP; the bus carries
-the billing pipeline. `metronome` and `invoicing` call the provider stubs
+the billing pipeline. `metering` and `invoicing` call the provider stubs
 (`fakemetronome` / `fakestripe`) over HTTP; those mirror the real Metronome /
 Stripe APIs.
 
@@ -34,29 +34,29 @@ Stripe APIs.
 control     frontend ─HTTP─▶ controlplane (/v1/generators…)      provision / start / stop
 (HTTP)      frontend ─HTTP─▶ billing (/v1/customers, …/close)    customers, cycle boundary
 
-usage       controlplane usage process ─usage.ingested─▶ [bus] ─▶ metronome
+usage       controlplane usage process ─usage.ingested─▶ [bus] ─▶ metering
 (bus)                                                              │  late = occurred_at < period_start
                                                                    └─(batch)─▶ Metronome  (meter; invoicing off)
 
 subs        controlplane subscription process ─subscription.activated/cancelled─▶ [bus] ─▶ invoicing ─▶ Stripe
 
 mid-cycle   frontend ─HTTP─▶ invoicing (/v1/customers/{id}/upcoming-invoice)
-(read)                        ├─ list-costs ◀── metronome ◀── Metronome   (priced usage, grouped)
+(read)                        ├─ list-costs ◀── metering ◀── Metronome   (priced usage, grouped)
                               └─ subscriptions ◀── Stripe
 
 cycle end   frontend ─▶ billing (…/close) ─billing_cycle.ended─▶ [bus] ─┬─▶ invoicing
-                                                                        └─▶ metronome  (records period boundary)
+                                                                        └─▶ metering  (records period boundary)
             invoicing ── close-period (shim) ──▶ Metronome              (finalized priced usage)
             invoicing ── invoice items + invoice ─▶ Stripe              (+ active subscriptions)
             invoicing ─invoice.finalized, payment.succeeded/failed─▶ [bus] ─▶ billing
 ```
 
 Notes:
-- **Lateness** is determined by `metronome` (event `occurred_at` vs the period
+- **Lateness** is determined by `metering` (event `occurred_at` vs the period
   start it learns from `billing_cycle.ended`), stamped as a `late` dimension, and
   billed as its own line. The source never marks lateness — see *Late-arriving usage*.
 - **`billing_cycle.ended` has two consumers**: `invoicing` (to invoice) and
-  `metronome` (to record the new period boundary).
+  `metering` (to record the new period boundary).
 - **`close-period` is a demo shim** (real Metronome has no such call) — see
   *Metronome API fidelity*.
 
@@ -78,7 +78,7 @@ internal/
   events/       event types + bus contract, in-memory + Kafka implementations
   billing/      billing orchestration service (usage ingest, cycle boundary)
   invoicing/    Stripe invoicing integration
-  metronome/    Metronome metering integration
+  metering/    Metronome metering integration
   fakemetronome/ local stand-in for the Metronome API
   fakestripe/   local stand-in for the Stripe API
   controlplane/ control plane for usage/subscription generator processes
@@ -91,7 +91,7 @@ Backend:
 
 ```sh
 make build          # build all three binaries into ./bin
-make run-billing    # or run-stripe / run-metronome
+make run-billing    # or run-invoicing / run-metering
 make vet            # go vet ./...
 ```
 
@@ -129,7 +129,7 @@ CUST=$(curl -s -X POST http://localhost/v1/customers -d '{"name":"Acme Inc"}' | 
 
 **2. Provision + start a generator process** for that customer (provisioning is
 rejected for an unknown customer). It publishes `usage.ingested` every
-`interval_ms`; metronome meters it:
+`interval_ms`; metering meters it:
 
 ```sh
 ID=$(curl -s -X POST http://localhost/v1/generators \
@@ -158,7 +158,7 @@ curl -X POST http://localhost/v1/billing-cycles/$CUST/close
 Watch the invoicing chain light up in the Console, each hop on its own topic:
 
 ```
-billing_cycle.ended → (stripe queries metronome) → invoice.finalized → payment.succeeded
+billing_cycle.ended → (invoicing queries metering) → invoice.finalized → payment.succeeded
 ```
 
 Metering + pricing (via `fakemetronome`) and the invoice (via `fakestripe`) are
@@ -247,7 +247,7 @@ Two design rules make this faithful to how you'd build it on real Metronome:
   **group by properties you send** — there is no built-in "late" dimension. So
   neither `fakemetronome` nor real Metronome computes it.
 
-Lateness is therefore **determined by the `metronome` ingestion service** (the
+Lateness is therefore **determined by the `metering` ingestion service** (the
 layer that enriches events before sending them to Metronome):
 
 1. It learns each customer's current period start from `billing_cycle.ended`.
@@ -272,7 +272,7 @@ mirrors production.
 - **`GET /v1/customers/{id}/costs`** mirrors real Metronome's **list-costs**
   (`v1.customers.listCosts`) — a faithful subset returning priced usage as
   `data[].line_item_breakdown[]` (`name`, `groups`, `quantity`, `unit_price`,
-  `cost` in USD). This is the read the `metronome` service uses for the mid-cycle
+  `cost` in USD). This is the read the `metering` service uses for the mid-cycle
   preview; real Metronome exposes mid-period *priced* usage via costs / the draft
   invoice, not a bespoke usage endpoint.
 
@@ -315,7 +315,7 @@ implementation** takes demo shortcuts that would not. Here's the gap and the pat
   only one consumer per group; no parallelism.
 - **Unbounded memory** — `fakemetronome.seen` (every `transaction_id` forever)
   and `fakestripe.invoices` grow without limit.
-- **Serial flush, no retry** — the metronome ingest batcher drops a batch on a
+- **Serial flush, no retry** — the metering ingest batcher drops a batch on a
   failed `/ingest` (the `transaction_id` makes retry *safe*, it's just not done).
 - **No caching on the mid-cycle read** — every dashboard poll hits Metronome live.
 - **Cycle-close fan-out** — all cycles closing at once funnel through one
@@ -323,7 +323,7 @@ implementation** takes demo shortcuts that would not. Here's the gap and the pat
 
 ### Path to production (roughly in priority)
 1. **Partition the topics by `customer_id`** (already the record key) and run
-   **multiple stateless consumer instances per group** so `metronome`/`invoicing`
+   **multiple stateless consumer instances per group** so `metering`/`invoicing`
    scale horizontally.
 2. **Externalize state** — move the customer registry and orchestration state to
    a real datastore (Postgres/Dynamo); lean on Metronome/Stripe as the source of

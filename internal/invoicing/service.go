@@ -23,23 +23,23 @@ import (
 
 // Service is the Stripe integration service.
 type Service struct {
-	cfg          config.Config
-	bus          events.Bus
-	log          *slog.Logger
-	http         *http.Client
-	baseURL      string // Stripe API (fakestripe)
-	metronomeURL string // metronome service, for the usage+price query
+	cfg         config.Config
+	bus         events.Bus
+	log         *slog.Logger
+	http        *http.Client
+	baseURL     string // Stripe API (fakestripe)
+	meteringURL string // metering service, for the usage+price query
 }
 
 // New constructs the Stripe service.
 func New(cfg config.Config, bus events.Bus, log *slog.Logger) *Service {
 	return &Service{
-		cfg:          cfg,
-		bus:          bus,
-		log:          log,
-		http:         &http.Client{Timeout: 10 * time.Second},
-		baseURL:      cfg.StripeBaseURL,
-		metronomeURL: cfg.MetronomeServiceURL,
+		cfg:         cfg,
+		bus:         bus,
+		log:         log,
+		http:        &http.Client{Timeout: 10 * time.Second},
+		baseURL:     cfg.StripeBaseURL,
+		meteringURL: cfg.MeteringServiceURL,
 	}
 }
 
@@ -73,7 +73,7 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		Currency string       `json:"currency"`
 		Groups   []usageGroup `json:"groups"`
 	}
-	if err := s.getJSON(r.Context(), s.metronomeURL+"/v1/customers/"+id+"/usage", &usage); err != nil {
+	if err := s.getJSON(r.Context(), s.meteringURL+"/v1/customers/"+id+"/usage", &usage); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -213,7 +213,7 @@ func (s *Service) onBillingCycleEnded(ctx context.Context, e events.Event) error
 		Currency string       `json:"currency"`
 		Groups   []usageGroup `json:"groups"`
 	}
-	if err := s.postJSON(ctx, s.metronomeURL+"/v1/customers/"+e.CustomerID+"/close-period", nil, &billed); err != nil {
+	if err := s.postJSON(ctx, s.meteringURL+"/v1/customers/"+e.CustomerID+"/close-period", nil, &billed); err != nil {
 		return fmt.Errorf("query metronome usage: %w", err)
 	}
 	currency := billed.Currency

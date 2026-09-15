@@ -76,13 +76,13 @@ services:
       KAFKA_SEEDS: redpanda:9092
       INVOICING_HTTP_ADDR: ":8081"
       STRIPE_BASE_URL: http://fakestripe:8084
-      METRONOME_SERVICE_URL: http://metronome:8082
+      METERING_SERVICE_URL: http://metering:8082
     depends_on:
       redpanda:
         condition: service_healthy
       fakestripe:
         condition: service_started
-      metronome:
+      metering:
         condition: service_started
     restart: unless-stopped
     deploy:
@@ -104,15 +104,15 @@ services:
         limits:
           memory: 64M
 
-  metronome:
+  metering:
     build:
       context: .
       args:
-        SERVICE: metronome
+        SERVICE: metering
     environment:
       BUS: kafka
       KAFKA_SEEDS: redpanda:9092
-      METRONOME_HTTP_ADDR: ":8082"
+      METERING_HTTP_ADDR: ":8082"
       METRONOME_BASE_URL: http://fakemetronome:8083
     depends_on:
       redpanda:
@@ -177,7 +177,7 @@ services:
     depends_on:
       - billing
       - controlplane
-      - metronome
+      - metering
     restart: unless-stopped
     deploy:
       resources:

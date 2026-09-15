@@ -1,8 +1,8 @@
-.PHONY: build run-invoicing run-metronome run-billing run-fakemetronome run-fakestripe run-controlplane tidy vet web-install web-dev clean
+.PHONY: build run-invoicing run-metering run-billing run-fakemetronome run-fakestripe run-controlplane tidy vet web-install web-dev clean
 
 build:
 	go build -o bin/invoicing ./cmd/invoicing
-	go build -o bin/metronome ./cmd/metronome
+	go build -o bin/metering ./cmd/metering
 	go build -o bin/billing ./cmd/billing
 	go build -o bin/fakemetronome ./cmd/fakemetronome
 	go build -o bin/fakestripe ./cmd/fakestripe
@@ -11,8 +11,8 @@ build:
 run-invoicing:
 	go run ./cmd/invoicing
 
-run-metronome:
-	go run ./cmd/metronome
+run-metering:
+	go run ./cmd/metering
 
 run-billing:
 	go run ./cmd/billing

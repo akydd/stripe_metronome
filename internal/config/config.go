@@ -22,9 +22,9 @@ type Config struct {
 	// StripeBaseURL is the base URL of the Stripe API (the local fakestripe by
 	// default, or real Stripe test mode).
 	StripeBaseURL string
-	// MetronomeServiceURL is the base URL of the metronome service, which the
-	// stripe service queries for usage+price at cycle end.
-	MetronomeServiceURL string
+	// MeteringServiceURL is the base URL of the metering service, which the
+	// invoicing service queries for usage+price at cycle end.
+	MeteringServiceURL string
 	// BillingURL is the base URL of the billing service, which the generator
 	// uses to validate a process's customer against the registry.
 	BillingURL string
@@ -39,15 +39,15 @@ type Config struct {
 // and defaultAddr is used when that variable is unset.
 func Load(prefix, defaultAddr string) Config {
 	return Config{
-		HTTPAddr:            env(prefix+"_HTTP_ADDR", defaultAddr),
-		BusKind:             env("BUS", "memory"),
-		KafkaSeeds:          splitSeeds(env("KAFKA_SEEDS", "localhost:9092")),
-		MetronomeBaseURL:    env("METRONOME_BASE_URL", "http://localhost:8083"),
-		StripeBaseURL:       env("STRIPE_BASE_URL", "http://localhost:8084"),
-		MetronomeServiceURL: env("METRONOME_SERVICE_URL", "http://localhost:8082"),
-		BillingURL:          env("BILLING_URL", "http://localhost:8080"),
-		StripeAPIKey:        os.Getenv("STRIPE_API_KEY"),
-		MetronomeAPIKey:     os.Getenv("METRONOME_API_KEY"),
+		HTTPAddr:           env(prefix+"_HTTP_ADDR", defaultAddr),
+		BusKind:            env("BUS", "memory"),
+		KafkaSeeds:         splitSeeds(env("KAFKA_SEEDS", "localhost:9092")),
+		MetronomeBaseURL:   env("METRONOME_BASE_URL", "http://localhost:8083"),
+		StripeBaseURL:      env("STRIPE_BASE_URL", "http://localhost:8084"),
+		MeteringServiceURL: env("METERING_SERVICE_URL", "http://localhost:8082"),
+		BillingURL:         env("BILLING_URL", "http://localhost:8080"),
+		StripeAPIKey:       os.Getenv("STRIPE_API_KEY"),
+		MetronomeAPIKey:    os.Getenv("METRONOME_API_KEY"),
 	}
 }
 

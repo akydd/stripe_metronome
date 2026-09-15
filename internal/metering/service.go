@@ -1,10 +1,10 @@
-// Package metronome implements the metering integration with Metronome:
+// Package metering implements the metering integration with Metronome:
 // forwarding ingested usage to the Metronome /ingest API, exposing mid-billing-
 // period usage, and closing a period on request (returning its priced usage).
 // Invoicing is disabled here — Stripe owns the invoice and pulls usage+price via
 // the close-period endpoint at cycle end. Talks to METRONOME_BASE_URL (the local
 // fakemetronome by default, or the real API).
-package metronome
+package metering
 
 import (
 	"bytes"
