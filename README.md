@@ -1,20 +1,25 @@
 # stripe_metronome
 
-An event-driven billing platform that meters usage in **Metronome**, orchestrates
-invoicing in a **billing** service, and collects payment through **Stripe**.
+An event-driven billing platform: it meters usage in **Metronome** (the `metering`
+service), manages customers and billing cycles in the `billing` service, and
+invoices + collects payment through **Stripe** (the `invoicing` service). Usage
+flows over a Kafka event bus; provider calls go to local Metronome/Stripe
+stand-ins (`fakemetronome` / `fakestripe`).
 
-Everything here is scaffolding — services, event contracts, and the frontend are
-wired together but the implementations are intentionally empty (`TODO`s).
+It's a working demo — single box, in-memory state (see *Production scaling*) — not
+a production system.
 
 ## Services
 
-Each service is its own binary under `cmd/` and communicates only via the event
-bus (`internal/events`) — never by calling another service directly.
+Each service is its own binary under `cmd/`. The **billing pipeline** flows over
+the event bus (`internal/events`); **reads and provider calls** are synchronous
+HTTP (e.g. `invoicing → metering`, `metering → fakemetronome`, `controlplane →
+billing` for customer validation).
 
 | Service     | Binary            | Default addr | Responsibility |
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping), the billing-cycle boundary (`billing_cycle.ended`), and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
-| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and flat-fee subscriptions** (`subscription.activated`/`cancelled`). On `billing_cycle.ended`, queries Metronome for usage, creates the invoice (usage items + active subscription fees), maps the payment outcome onto the bus. Calls `STRIPE_BASE_URL` + `METRONOME_SERVICE_URL`. |
+| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and flat-fee subscriptions** (`subscription.activated`/`cancelled`). On `billing_cycle.ended`, queries Metronome for usage, creates the invoice (usage items + active subscription fees), maps the payment outcome onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
 | `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs) mirror real endpoints. `close-period` is a **demo shim** (real Metronome has no such call). Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
@@ -83,6 +88,7 @@ internal/
   fakestripe/   local stand-in for the Stripe API
   controlplane/ control plane for usage/subscription generator processes
 web/            React + Vite + TypeScript frontend (usage dashboard)
+infra/terraform/ provisions the demo EC2 instance (t4g.small)
 ```
 
 ## Getting started
@@ -90,8 +96,8 @@ web/            React + Vite + TypeScript frontend (usage dashboard)
 Backend:
 
 ```sh
-make build          # build all three binaries into ./bin
-make run-billing    # or run-invoicing / run-metering
+make build          # build all service binaries into ./bin
+make run-billing    # or run-invoicing / run-metering / run-controlplane / run-fake*
 make vet            # go vet ./...
 ```
 
@@ -99,12 +105,12 @@ Frontend:
 
 ```sh
 make web-install    # npm install (in ./web)
-make web-dev        # vite dev server, proxies /v1 to billing on :8080
+make web-dev        # vite dev server (proxies /v1 to billing; full routing needs the Docker stack's nginx)
 ```
 
 ## Run the full stack (Docker Compose)
 
-Brings up Redpanda + Console + all three services (on the Kafka bus) + the web app:
+Brings up Redpanda + Console + all services (on the Kafka bus) + the web app:
 
 ```sh
 docker compose up --build
@@ -140,16 +146,19 @@ curl -X POST http://localhost/v1/generators/$ID/start
 Watch `usage.ingested` populate in the Console. Stop it anytime:
 `curl -X POST http://localhost/v1/generators/$ID/stop`.
 
-**3. Check mid-period usage** (the thing Stripe alone can't show) — Metronome
-prices it:
+**3. Check the mid-cycle invoice** (the thing Stripe alone can't show) — the
+`invoicing` service reads priced usage from Metronome (list-costs) + active
+subscriptions and previews what would be billed:
 
 ```sh
-curl http://localhost/v1/customers/$CUST/usage
-# {"customer_id":"cus_acme-inc_ab12cd34","period":0,"events":3,"quantity":9,"amount_cents":900,...}
+curl http://localhost/v1/customers/$CUST/upcoming-invoice
+# {"amount_cents":9,"amount_micros":90000,"lines":[
+#   {"description":"API requests · gen 1a2b3c4d","quantity":900,"amount_micros":90000,"unit_price_micros":100}],
+#  "upcoming":true,...}
 ```
 
-**4. Close the billing cycle** — billing emits `billing_cycle.ended`; Stripe pulls
-the priced usage from Metronome and invoices it:
+**4. Close the billing cycle** — billing emits `billing_cycle.ended`; the
+`invoicing` service pulls the priced usage from Metronome and invoices it:
 
 ```sh
 curl -X POST http://localhost/v1/billing-cycles/$CUST/close
@@ -167,11 +176,11 @@ real; only the provider APIs themselves are stubbed. The usage rate is a hardcod
 are skipped (no invoice).
 
 **Hybrid billing:** provision a **subscription** generator too and start it — then
-close the cycle. The invoice carries both a usage line (`API requests (period N)`)
+close the cycle. The invoice carries both a usage line (`API requests · gen … (period N)`)
 and a subscription line, because **Stripe** manages the flat-fee subscription and
-adds it when it creates the invoice, alongside the metered-usage item Stripe
-pulled from Metronome. The subscription price is a **fixed plan price owned by
-Stripe** — the frontend can display it but not set it:
+adds it when it creates the invoice, alongside the metered-usage items the
+`invoicing` service pulled from Metronome. The subscription price is a **fixed plan
+price owned by Stripe** — the frontend can display it but not set it:
 
 ```sh
 curl -s http://localhost/v1/subscription-plan            # {"amount_cents":5000,"currency":"usd"}
@@ -180,14 +189,15 @@ curl -s -X POST http://localhost/v1/generators \
 # then start it, and close the cycle as in step 4
 ```
 
-**5. Late-usage rollover:** usage that arrives after a cycle closes accrues to the
-next period and bills on the *following* `close` — not the invoice just issued.
-A running generator produces this on its own, or fire it on demand (works even
-for a stopped generator):
+**5. Late-arriving usage:** the `emit` endpoint **backdates** usage timestamps to
+simulate usage that occurred before the current period started (works even for a
+stopped generator). The `metering` service flags it late (`occurred_at <
+period_start`), so it bills as its own **`Late usage`** line on the next invoice —
+separate from on-time usage. (Close a cycle first so a period boundary exists.)
 
 ```sh
-curl -X POST "http://localhost/v1/generators/$UPROC/emit?count=3"   # 3 late usage events
-curl -X POST http://localhost/v1/billing-cycles/$CUST/close          # they land here
+curl -X POST "http://localhost/v1/generators/$ID/emit?count=2000"   # backdated -> late
+curl -X POST http://localhost/v1/billing-cycles/$CUST/close          # bills as a "Late usage" line
 ```
 
 **Payment failure branch:** a customer whose id contains `fail` doesn't pay (e.g.
@@ -287,7 +297,11 @@ events, and uses one hardcoded rate instead of configured rate cards.
 ## Deploy to an AWS t4g.small
 
 The stack is memory-tuned for a 2 GB `t4g.small` (free via the EC2 T4g trial
-through Dec 31 2026 — 750 hrs/month ≈ one always-on instance). On the instance:
+through Dec 31 2026 — 750 hrs/month ≈ one always-on instance).
+
+**Terraform** (`infra/terraform/`) provisions the instance, security group, swap,
+and Docker, and can self-deploy on boot (clone + `docker compose up`). See that
+directory's README. To do it by hand instead, on the instance:
 
 1. Add swap for headroom: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
 2. Install Docker + the compose plugin.
