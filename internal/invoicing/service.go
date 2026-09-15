@@ -1,10 +1,10 @@
-// Package stripe implements the invoicing integration with Stripe. Stripe owns
+// Package invoicing implements the invoicing integration with Stripe. Stripe owns
 // the invoice: at the end of a billing cycle (billing_cycle.ended) this service
 // queries Metronome for the period's usage + price, creates the invoice items and
 // invoice in Stripe, and maps the payment outcome back onto the bus. It talks to
 // STRIPE_BASE_URL (fakestripe by default, or real Stripe test mode) and to the
 // metronome service at METRONOME_SERVICE_URL.
-package stripe
+package invoicing
 
 import (
 	"bytes"

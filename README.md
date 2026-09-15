@@ -14,7 +14,7 @@ bus (`internal/events`) — never by calling another service directly.
 | Service     | Binary            | Default addr | Responsibility |
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping), the billing-cycle boundary (`billing_cycle.ended`), and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
-| `stripe`    | `cmd/stripe`      | `:8081`      | Owns the invoice **and flat-fee subscriptions** (`subscription.activated`/`cancelled`). On `billing_cycle.ended`, queries Metronome for usage, creates the invoice (usage items + active subscription fees), maps the payment outcome onto the bus. Calls `STRIPE_BASE_URL` + `METRONOME_SERVICE_URL`. |
+| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and flat-fee subscriptions** (`subscription.activated`/`cancelled`). On `billing_cycle.ended`, queries Metronome for usage, creates the invoice (usage items + active subscription fees), maps the payment outcome onto the bus. Calls `STRIPE_BASE_URL` + `METRONOME_SERVICE_URL`. |
 | `metronome` | `cmd/metronome`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs) mirror real endpoints. `close-period` is a **demo shim** (real Metronome has no such call). Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
@@ -24,25 +24,41 @@ Override a listen address with `<SERVICE>_HTTP_ADDR` (e.g. `BILLING_HTTP_ADDR`).
 
 ## Event flow
 
-Two planes. **Control** (frontend → controlplane, over HTTP) provisions and
-starts/stops generator processes. **Data** (controlplane processes → bus →
-metronome) carries usage. Invoicing happens only at cycle end, when Stripe pulls
-the priced usage.
+Services publish/subscribe to domain events (each event type is a Kafka topic).
+Reads (mid-cycle preview, invoice history) are synchronous HTTP; the bus carries
+the billing pipeline. `metronome` and `invoicing` call the provider stubs
+(`fakemetronome` / `fakestripe`) over HTTP; those mirror the real Metronome /
+Stripe APIs.
 
 ```
-control:  frontend ─▶ controlplane (/v1/generators…)   (provision / start / stop)
+control     frontend ─HTTP─▶ controlplane (/v1/generators…)      provision / start / stop
+(HTTP)      frontend ─HTTP─▶ billing (/v1/customers, …/close)    customers, cycle boundary
 
-data:     controlplane usage process ─usage.ingested─▶ [bus] ─▶ metronome ─(meter)─▶ Metronome
-                                                                              (invoicing off)
+usage       controlplane usage process ─usage.ingested─▶ [bus] ─▶ metronome
+(bus)                                                              │  late = occurred_at < period_start
+                                                                   └─(batch)─▶ Metronome  (meter; invoicing off)
 
-cycle end: frontend ─▶ billing (/v1/billing-cycles/{c}/close) ─billing_cycle.ended─▶ stripe
-                       query usage + price (close-period) ◀───────────────────────────┤
-                       create invoice (items + invoice) ─▶ Stripe                     │
-           billing ◀── payment.succeeded / payment.failed ── stripe ── invoice.finalized
+subs        controlplane subscription process ─subscription.activated/cancelled─▶ [bus] ─▶ invoicing ─▶ Stripe
+
+mid-cycle   frontend ─HTTP─▶ invoicing (/v1/customers/{id}/upcoming-invoice)
+(read)                        ├─ list-costs ◀── metronome ◀── Metronome   (priced usage, grouped)
+                              └─ subscriptions ◀── Stripe
+
+cycle end   frontend ─▶ billing (…/close) ─billing_cycle.ended─▶ [bus] ─┬─▶ invoicing
+                                                                        └─▶ metronome  (records period boundary)
+            invoicing ── close-period (shim) ──▶ Metronome              (finalized priced usage)
+            invoicing ── invoice items + invoice ─▶ Stripe              (+ active subscriptions)
+            invoicing ─invoice.finalized, payment.succeeded/failed─▶ [bus] ─▶ billing
 ```
 
-Late-arriving usage: closing a period opens a fresh one, so any usage metered
-after the close accrues to the next period and rolls onto the following invoice.
+Notes:
+- **Lateness** is determined by `metronome` (event `occurred_at` vs the period
+  start it learns from `billing_cycle.ended`), stamped as a `late` dimension, and
+  billed as its own line. The source never marks lateness — see *Late-arriving usage*.
+- **`billing_cycle.ended` has two consumers**: `invoicing` (to invoice) and
+  `metronome` (to record the new period boundary).
+- **`close-period` is a demo shim** (real Metronome has no such call) — see
+  *Metronome API fidelity*.
 
 Event types live in `internal/events/event.go`, each doubling as its Kafka topic
 name. Two `Bus` implementations sit behind one interface:
@@ -61,7 +77,7 @@ internal/
   config/       env-based configuration
   events/       event types + bus contract, in-memory + Kafka implementations
   billing/      billing orchestration service (usage ingest, cycle boundary)
-  stripe/       Stripe invoicing integration
+  invoicing/    Stripe invoicing integration
   metronome/    Metronome metering integration
   fakemetronome/ local stand-in for the Metronome API
   fakestripe/   local stand-in for the Stripe API
@@ -307,7 +323,7 @@ implementation** takes demo shortcuts that would not. Here's the gap and the pat
 
 ### Path to production (roughly in priority)
 1. **Partition the topics by `customer_id`** (already the record key) and run
-   **multiple stateless consumer instances per group** so `metronome`/`stripe`
+   **multiple stateless consumer instances per group** so `metronome`/`invoicing`
    scale horizontally.
 2. **Externalize state** — move the customer registry and orchestration state to
    a real datastore (Postgres/Dynamo); lean on Metronome/Stripe as the source of
@@ -323,10 +339,10 @@ The mid-cycle preview is read-only and eventually-consistent, so it caches well.
 Layered, cheapest first:
 - **Client**: poll only when the panel is open *and* the tab is visible; back off
   to 5–10s; send `ETag`/`If-None-Match` for cheap `304`s.
-- **Service cache**: short-TTL (a few seconds) cache in `stripe`, keyed by
+- **Service cache**: short-TTL (a few seconds) cache in `invoicing`, keyed by
   `customer_id + period`, with **single-flight** so concurrent misses for one
   customer collapse to a single Metronome read. Use a shared cache (Redis) once
-  there is more than one `stripe` instance. Invalidate on `billing_cycle.ended`.
+  there is more than one `invoicing` instance. Invalidate on `billing_cycle.ended`.
 - **Rate-limit backstop** toward Metronome so a cache-wide miss can't exceed its
   limits.
 - **Only if metrics demand it**: a materialized per-customer usage counter

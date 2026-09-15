@@ -66,15 +66,15 @@ services:
         limits:
           memory: 96M
 
-  stripe:
+  invoicing:
     build:
       context: .
       args:
-        SERVICE: stripe
+        SERVICE: invoicing
     environment:
       BUS: kafka
       KAFKA_SEEDS: redpanda:9092
-      STRIPE_HTTP_ADDR: ":8081"
+      INVOICING_HTTP_ADDR: ":8081"
       STRIPE_BASE_URL: http://fakestripe:8084
       METRONOME_SERVICE_URL: http://metronome:8082
     depends_on:
