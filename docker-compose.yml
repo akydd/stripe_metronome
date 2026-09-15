@@ -1,0 +1,185 @@
+# Full stack, memory-tuned to fit a 2 GB AWS t4g.small (free via the EC2 T4g
+# trial through Dec 31 2026). Total container limits ~1.5 GB, leaving headroom
+# for the host OS; add a 2 GB swapfile on the instance for spikes (see README).
+name: stripe-metronome
+
+services:
+  # Kafka-API broker, run in low-resource mode.
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --overprovisioned          # don't assume dedicated cores
+      - --smp=1                     # single core
+      - --memory=900M              # cap Redpanda's own memory
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --default-log-level=warn
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"              # external Kafka listener (optional tooling)
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
+  # Web UI for observing topics and messages as they propagate.
+  console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"                # http://<host>:8080
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 220M
+
+  billing:
+    build:
+      context: .
+      args:
+        SERVICE: billing
+    environment:
+      BUS: kafka
+      KAFKA_SEEDS: redpanda:9092
+      BILLING_HTTP_ADDR: ":8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  stripe:
+    build:
+      context: .
+      args:
+        SERVICE: stripe
+    environment:
+      BUS: kafka
+      KAFKA_SEEDS: redpanda:9092
+      STRIPE_HTTP_ADDR: ":8081"
+      STRIPE_BASE_URL: http://fakestripe:8084
+      METRONOME_SERVICE_URL: http://metronome:8082
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      fakestripe:
+        condition: service_started
+      metronome:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  # Local stand-in for the Stripe API (no external dependency / secrets).
+  fakestripe:
+    build:
+      context: .
+      args:
+        SERVICE: fakestripe
+    environment:
+      FAKESTRIPE_HTTP_ADDR: ":8084"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  metronome:
+    build:
+      context: .
+      args:
+        SERVICE: metronome
+    environment:
+      BUS: kafka
+      KAFKA_SEEDS: redpanda:9092
+      METRONOME_HTTP_ADDR: ":8082"
+      METRONOME_BASE_URL: http://fakemetronome:8083
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      fakemetronome:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  # Local stand-in for the Metronome API (no external dependency / secrets).
+  fakemetronome:
+    build:
+      context: .
+      args:
+        SERVICE: fakemetronome
+    environment:
+      FAKEMETRONOME_HTTP_ADDR: ":8083"
+      # The billable metric's group_by dimensions (comma-separated event
+      # properties). Grouping by generator_id + late yields a distinct line per
+      # generator, split into on-time vs late usage.
+      METRONOME_GROUP_BY: generator_id,late
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  # Control plane for usage/subscription processes, provisioned from the frontend.
+  # Running usage processes publish usage.ingested to the bus; subscription
+  # processes publish subscription.activated/cancelled. On the Kafka bus so the
+  # other services can consume what it emits.
+  controlplane:
+    build:
+      context: .
+      args:
+        SERVICE: controlplane
+    environment:
+      BUS: kafka
+      KAFKA_SEEDS: redpanda:9092
+      CONTROLPLANE_HTTP_ADDR: ":8085"
+      BILLING_URL: http://billing:8080
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      billing:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  # React frontend + reverse proxy to the billing API.
+  web:
+    build:
+      context: ./web
+    ports:
+      - "80:80"                    # http://<host>/
+    depends_on:
+      - billing
+      - controlplane
+      - metronome
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 32M
