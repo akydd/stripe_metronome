@@ -36,6 +36,7 @@ export interface UpcomingInvoice {
   customer_id: string
   usage_micros: number
   subscription_micros: number
+  subscription_prorated: boolean
   amount_micros: number
   amount_cents: number // rounded once from amount_micros
   currency: string

@@ -239,6 +239,16 @@ The other lever real providers use — a **coarser billing unit** (e.g. "per 1,0
 requests") so sub-cent amounts rarely arise — is not used here; this project keeps
 the fine-grained per-request unit and relies on precise summation instead.
 
+**Subscription proration.** On the **mid-cycle preview**, a flat-fee subscription
+is shown *prorated* for the partial period — a `Subscription (prorated)` line at a
+default **$25** (vs the **$50** full-period plan price), with a note in the UI
+(`subscription_prorated` in the response). The **finalized invoice** at cycle close
+bills the **full period** ($50). Stripe owns the amounts (`fakestripe` exposes both
+`amount_cents` and `prorated_cents`); `invoicing` just picks the prorated one for
+the preview and labels it. The proration is a **fixed default**, not computed from
+elapsed period time — real Stripe prorates by the actual time fraction, and only
+when a subscription changes mid-period.
+
 ## Late-arriving usage
 
 "Late" usage is usage whose event timestamp falls **before the customer's current

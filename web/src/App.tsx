@@ -278,6 +278,12 @@ export function App() {
                   Metronome list-costs + active subscriptions; not finalized).
                 </p>
                 <InvoiceLines lines={view.data.lines} totalCents={view.data.amount_cents} />
+                {view.data.subscription_prorated && (
+                  <p className="text-secondary small mt-2 mb-0">
+                    * Flat-fee subscription shown prorated for the partial period; the full amount
+                    bills at cycle close.
+                  </p>
+                )}
               </>
             )}
             {view.kind === 'all' && (
@@ -301,6 +307,12 @@ export function App() {
                   <span className="text-secondary small">(accruing, not finalized)</span>
                 </div>
                 <InvoiceLines lines={view.upcoming.lines} totalCents={view.upcoming.amount_cents} />
+                {view.upcoming.subscription_prorated && (
+                  <p className="text-secondary small mt-2 mb-0">
+                    * Flat-fee subscription shown prorated for the partial period; the full amount
+                    bills at cycle close.
+                  </p>
+                )}
                 {view.finalized.length === 0 && (
                   <p className="text-secondary small mt-2 mb-0">No finalized invoices yet.</p>
                 )}

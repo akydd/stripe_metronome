@@ -19,9 +19,22 @@ import (
 	"time"
 )
 
-// subscriptionPriceCents is the fixed flat-fee price per period, owned by Stripe
-// (like a Stripe Price on a plan). It is NOT set by the frontend.
-const subscriptionPriceCents = 5000
+// subscriptionPriceCents is the fixed flat-fee price for a full period, owned by
+// Stripe (like a Stripe Price on a plan). It is NOT set by the frontend.
+// subscriptionProratedCents is the default prorated amount shown for a partial
+// (mid-cycle) period. A finalized full period bills subscriptionPriceCents.
+const (
+	subscriptionPriceCents    = 5000 // $50.00 / full period
+	subscriptionProratedCents = 2500 // $25.00 default prorated (partial period)
+)
+
+// proratedCents scales a full-period amount to the default prorated fraction.
+func proratedCents(fullCents int) int {
+	if subscriptionPriceCents == 0 {
+		return 0
+	}
+	return fullCents * subscriptionProratedCents / subscriptionPriceCents
+}
 
 // Service holds pending invoice items, active subscriptions, and finalized
 // invoices per customer.
@@ -194,16 +207,23 @@ func (s *Service) handleListSubscriptions(w http.ResponseWriter, r *http.Request
 	s.mu.Lock()
 	type sub struct {
 		SubscriptionID string `json:"subscription_id"`
-		AmountCents    int    `json:"amount_cents"`
+		AmountCents    int    `json:"amount_cents"`   // full period
+		ProratedCents  int    `json:"prorated_cents"` // partial (mid-cycle) period
 	}
 	subs := make([]sub, 0, len(s.subs[id]))
-	total := 0
+	total, proratedTotal := 0, 0
 	for sid, amt := range s.subs[id] {
-		subs = append(subs, sub{SubscriptionID: sid, AmountCents: amt})
+		p := proratedCents(amt)
+		subs = append(subs, sub{SubscriptionID: sid, AmountCents: amt, ProratedCents: p})
 		total += amt
+		proratedTotal += p
 	}
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": subs, "total_cents": total})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"subscriptions":        subs,
+		"total_cents":          total,
+		"prorated_total_cents": proratedTotal,
+	})
 }
 
 // handleSubscriptionPlan returns the fixed flat-fee price, so the frontend can

@@ -78,7 +78,8 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var subs struct {
-		TotalCents int `json:"total_cents"`
+		TotalCents         int `json:"total_cents"`
+		ProratedTotalCents int `json:"prorated_total_cents"`
 	}
 	if err := s.getJSON(r.Context(), s.baseURL+"/v1/customers/"+id+"/subscriptions", &subs); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -89,11 +90,14 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		currency = "usd"
 	}
 
+	// Mid-cycle shows the subscription PRORATED for the partial period; the
+	// finalized invoice bills the full period.
+	subscriptionProrated := subs.ProratedTotalCents > 0
 	lines := []map[string]any{}
-	if subs.TotalCents > 0 {
+	if subscriptionProrated {
 		lines = append(lines, map[string]any{
-			"description":   "Subscription",
-			"amount_micros": int64(subs.TotalCents) * microsPerCent,
+			"description":   "Subscription (prorated)",
+			"amount_micros": int64(subs.ProratedTotalCents) * microsPerCent,
 		})
 	}
 	var usageMicros int64
@@ -111,17 +115,18 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		})
 		usageMicros += g.UsageMicros
 	}
-	subMicros := int64(subs.TotalCents) * microsPerCent
+	subMicros := int64(subs.ProratedTotalCents) * microsPerCent
 	totalMicros := usageMicros + subMicros
 	writeJSON(w, http.StatusOK, map[string]any{
-		"customer_id":         id,
-		"usage_micros":        usageMicros,
-		"subscription_micros": subMicros,
-		"amount_micros":       totalMicros,
-		"amount_cents":        roundCents(totalMicros), // rounded once
-		"currency":            currency,
-		"lines":               lines,
-		"upcoming":            true,
+		"customer_id":           id,
+		"usage_micros":          usageMicros,
+		"subscription_micros":   subMicros,
+		"subscription_prorated": subscriptionProrated,
+		"amount_micros":         totalMicros,
+		"amount_cents":          roundCents(totalMicros), // rounded once
+		"currency":              currency,
+		"lines":                 lines,
+		"upcoming":              true,
 	})
 }
 
