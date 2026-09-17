@@ -35,10 +35,14 @@ data "aws_iam_policy_document" "cd_assume" {
       variable = "token.actions.githubusercontent.com:aud"
       values   = ["sts.amazonaws.com"]
     }
+    # AWS requires the GitHub OIDC trust to be scoped by `sub` (or job_workflow_ref).
+    # This account uses GitHub's immutable subject claims, so `sub` is
+    # repo:<owner>@<owner_id>/<name>@<repo_id>:ref:refs/heads/<branch>. Wildcard the
+    # numeric IDs (immutable anyway) and pin owner, repo and branch.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/${var.deploy_branch}"]
+      values   = ["repo:${split("/", var.github_repo)[0]}@*/${split("/", var.github_repo)[1]}@*:ref:refs/heads/${var.deploy_branch}"]
     }
   }
 }

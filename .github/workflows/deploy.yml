@@ -36,22 +36,6 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      # TEMP DIAGNOSTIC: print the OIDC token's claims so we can match the trust
-      # policy exactly. Prints only decoded claims, never the token. Remove after.
-      - name: Debug OIDC claims
-        run: |
-          TOKEN=$(curl -sSL \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
-            | python3 -c 'import sys,json;print(json.load(sys.stdin)["value"])')
-          echo "$TOKEN" | python3 -c '
-          import sys,base64,json
-          p=sys.stdin.read().strip().split(".")[1]
-          p+="="*(-len(p)%4)
-          c=json.loads(base64.urlsafe_b64decode(p))
-          for k in ("iss","aud","sub","repository","repository_owner","ref","workflow"):
-              print(f"{k}: {c.get(k)}")'
-
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
