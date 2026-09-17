@@ -51,7 +51,8 @@ type process struct {
 	IntervalMS    int    `json:"interval_ms,omitempty"`     // usage only
 	EventsPerTick int    `json:"events_per_tick,omitempty"` // usage only
 	Running       bool   `json:"running"`
-	Emitted       int    `json:"emitted"` // usage: events emitted
+	Emitted       int    `json:"emitted"`   // usage: events emitted
+	Cancelled     bool   `json:"cancelled"` // subscription: cancellation is terminal
 
 	cancel context.CancelFunc
 }
@@ -149,6 +150,12 @@ func (m *Manager) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "process not found", http.StatusNotFound)
 		return
 	}
+	// A cancelled flat-fee subscription can never be resumed — provision a new one.
+	if p.Type == TypeSubscription && p.Cancelled {
+		m.mu.Unlock()
+		http.Error(w, "subscription was cancelled and cannot be resumed; provision a new subscription", http.StatusConflict)
+		return
+	}
 	started := false
 	if !p.Running {
 		p.Running = true
@@ -186,6 +193,10 @@ func (m *Manager) handleStop(w http.ResponseWriter, r *http.Request) {
 		if p.cancel != nil {
 			p.cancel()
 			p.cancel = nil
+		}
+		// Stopping a subscription cancels it, and cancellation is terminal.
+		if p.Type == TypeSubscription {
+			p.Cancelled = true
 		}
 	}
 	typ, cust := p.Type, p.CustomerID

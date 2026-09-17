@@ -572,6 +572,8 @@ export function App() {
                 <td>
                   {p.running ? (
                     <span className="text-success">● running</span>
+                  ) : p.cancelled ? (
+                    <span className="text-danger">⊘ cancelled</span>
                   ) : (
                     <span className="text-secondary">■ stopped</span>
                   )}
@@ -581,9 +583,9 @@ export function App() {
                   <div className="btn-group btn-group-sm">
                     {p.running ? (
                       <button className="btn btn-outline-secondary" onClick={() => run(() => stopGenerator(p.id))}>
-                        Stop
+                        {p.type === 'subscription' ? 'Cancel' : 'Stop'}
                       </button>
-                    ) : (
+                    ) : p.cancelled ? null : (
                       <button className="btn btn-outline-success" onClick={() => run(() => startGenerator(p.id))}>
                         Start
                       </button>

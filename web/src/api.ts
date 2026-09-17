@@ -18,6 +18,7 @@ export interface GeneratorProcess {
   events_per_tick?: number
   running: boolean
   emitted: number
+  cancelled?: boolean // subscription: cancellation is terminal (no resume)
 }
 
 export interface SubscriptionPlan {

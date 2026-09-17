@@ -258,6 +258,17 @@ the preview and labels it. The proration is a **fixed default**, not computed fr
 elapsed period time — real Stripe prorates by the actual time fraction, and only
 when a subscription changes mid-period.
 
+**Subscription cancellation.** Cancelling a flat-fee subscription mid-cycle
+(stopping the subscription generator) is **terminal** — it can never be resumed;
+a new subscription must be provisioned in its place (`controlplane` rejects a
+restart with `409`, and `fakestripe` rejects re-registering the same id). The
+cancelled subscription is **not** dropped immediately: it stays until the next
+invoice, which bills it at the **prorated** amount for the partial period it was
+active and lists it as `Subscription … (cancelled, prorated)`, then removes it (so
+it never bills again). An **active** subscription, by contrast, bills the full
+period at close. The mid-cycle preview reflects the pending cancellation, showing
+the sub as `Subscription (cancelled, prorated)`.
+
 ## Late-arriving usage
 
 "Late" usage is usage whose event timestamp falls **before the customer's current

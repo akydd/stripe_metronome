@@ -78,6 +78,11 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var subs struct {
+		Subscriptions []struct {
+			SubscriptionID string `json:"subscription_id"`
+			ProratedCents  int    `json:"prorated_cents"`
+			Cancelled      bool   `json:"cancelled"`
+		} `json:"subscriptions"`
 		TotalCents         int `json:"total_cents"`
 		ProratedTotalCents int `json:"prorated_total_cents"`
 	}
@@ -90,14 +95,23 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		currency = "usd"
 	}
 
-	// Mid-cycle shows the subscription PRORATED for the partial period; the
-	// finalized invoice bills the full period.
+	// Mid-cycle shows each subscription PRORATED for the partial period; the
+	// finalized invoice bills active subs the full period. A subscription
+	// cancelled mid-cycle stays on the preview at its prorated amount, labelled
+	// cancelled — that's what the close will bill.
 	subscriptionProrated := subs.ProratedTotalCents > 0
 	lines := []map[string]any{}
-	if subscriptionProrated {
+	for _, sub := range subs.Subscriptions {
+		if sub.ProratedCents <= 0 {
+			continue
+		}
+		desc := "Subscription (prorated)"
+		if sub.Cancelled {
+			desc = "Subscription (cancelled, prorated)"
+		}
 		lines = append(lines, map[string]any{
-			"description":   "Subscription (prorated)",
-			"amount_micros": int64(subs.ProratedTotalCents) * microsPerCent,
+			"description":   desc,
+			"amount_micros": int64(sub.ProratedCents) * microsPerCent,
 		})
 	}
 	var usageMicros int64

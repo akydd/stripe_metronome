@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,15 +37,25 @@ func proratedCents(fullCents int) int {
 	return fullCents * subscriptionProratedCents / subscriptionPriceCents
 }
 
-// Service holds pending invoice items, active subscriptions, and finalized
-// invoices per customer.
+// Service holds pending invoice items, subscriptions, and finalized invoices per
+// customer.
 type Service struct {
 	log      *slog.Logger
 	mu       sync.Mutex
 	seq      int
 	items    map[string][]line
-	subs     map[string]map[string]int // customer -> subscription id -> amount_cents
+	subs     map[string]map[string]*subState // customer -> subscription id -> state
 	invoices map[string][]map[string]any
+}
+
+// subState is a flat-fee subscription. A cancelled subscription is NOT removed
+// immediately: it stays until the next invoice, which bills it at the prorated
+// amount (for the partial period it was active) and then drops it. Cancellation
+// is terminal — a cancelled subscription is never reactivated; a new one must be
+// created in its place.
+type subState struct {
+	AmountCents int
+	Cancelled   bool
 }
 
 type line struct {
@@ -65,7 +76,7 @@ func New(log *slog.Logger) *Service {
 	return &Service{
 		log:      log,
 		items:    map[string][]line{},
-		subs:     map[string]map[string]int{},
+		subs:     map[string]map[string]*subState{},
 		invoices: map[string][]map[string]any{},
 	}
 }
@@ -136,15 +147,24 @@ func (s *Service) handleCreateInvoice(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	lines := s.items[req.Customer]
 	delete(s.items, req.Customer) // items are one-shot; subscriptions recur
-	// Add a line for each active subscription (recurring flat fee). Subscription
-	// prices are stored in cents; convert to micros for the line.
-	for sid, cents := range s.subs[req.Customer] {
+	// Add a line for each subscription (recurring flat fee). An active
+	// subscription bills the full period; one cancelled mid-cycle bills the
+	// prorated amount for the partial period and is then dropped (terminal).
+	// Prices are stored in cents; convert to micros for the line.
+	for sid, st := range s.subs[req.Customer] {
+		cents := st.AmountCents
+		desc := "Subscription " + sid
+		if st.Cancelled {
+			cents = proratedCents(st.AmountCents)
+			desc = "Subscription " + sid + " (cancelled, prorated)"
+			delete(s.subs[req.Customer], sid) // final billing — remove it
+		}
 		lines = append(lines, line{
 			ID:           s.nextID("sub_ii"),
 			Customer:     req.Customer,
 			AmountMicros: int64(cents) * microsPerCent,
 			Currency:     "usd",
-			Description:  "Subscription " + sid,
+			Description:  desc,
 		})
 	}
 	id := s.nextID("in")
@@ -201,7 +221,8 @@ func (s *Service) handleListInvoices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// handleListSubscriptions returns the customer's active subscriptions and their total.
+// handleListSubscriptions returns the customer's subscriptions (active and
+// cancelled-but-not-yet-invoiced) and their totals.
 func (s *Service) handleListSubscriptions(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()
@@ -209,16 +230,23 @@ func (s *Service) handleListSubscriptions(w http.ResponseWriter, r *http.Request
 		SubscriptionID string `json:"subscription_id"`
 		AmountCents    int    `json:"amount_cents"`   // full period
 		ProratedCents  int    `json:"prorated_cents"` // partial (mid-cycle) period
+		Cancelled      bool   `json:"cancelled"`
 	}
 	subs := make([]sub, 0, len(s.subs[id]))
+	// total_cents is the full-period charge (active subs only — a cancelled sub
+	// never bills a full period). prorated_total_cents is what a close-now would
+	// bill: the prorated amount for every subscription, active or cancelled.
 	total, proratedTotal := 0, 0
-	for sid, amt := range s.subs[id] {
-		p := proratedCents(amt)
-		subs = append(subs, sub{SubscriptionID: sid, AmountCents: amt, ProratedCents: p})
-		total += amt
+	for sid, st := range s.subs[id] {
+		p := proratedCents(st.AmountCents)
+		subs = append(subs, sub{SubscriptionID: sid, AmountCents: st.AmountCents, ProratedCents: p, Cancelled: st.Cancelled})
+		if !st.Cancelled {
+			total += st.AmountCents
+		}
 		proratedTotal += p
 	}
 	s.mu.Unlock()
+	sort.Slice(subs, func(i, j int) bool { return subs[i].SubscriptionID < subs[j].SubscriptionID })
 	writeJSON(w, http.StatusOK, map[string]any{
 		"subscriptions":        subs,
 		"total_cents":          total,
@@ -245,21 +273,31 @@ func (s *Service) handleAddSubscription(w http.ResponseWriter, r *http.Request) 
 	}
 	s.mu.Lock()
 	if s.subs[id] == nil {
-		s.subs[id] = map[string]int{}
+		s.subs[id] = map[string]*subState{}
 	}
-	s.subs[id][req.SubscriptionID] = subscriptionPriceCents
+	// Cancellation is terminal: a cancelled subscription is never reactivated.
+	if existing := s.subs[id][req.SubscriptionID]; existing != nil && existing.Cancelled {
+		s.mu.Unlock()
+		http.Error(w, "subscription was cancelled and cannot be reactivated; create a new one", http.StatusConflict)
+		return
+	}
+	s.subs[id][req.SubscriptionID] = &subState{AmountCents: subscriptionPriceCents}
 	s.mu.Unlock()
 
 	s.log.Info("subscription registered", "customer", id, "subscription", req.SubscriptionID, "amount_cents", subscriptionPriceCents)
 	writeJSON(w, http.StatusOK, map[string]any{"customer": id, "subscription_id": req.SubscriptionID, "amount_cents": subscriptionPriceCents})
 }
 
-// handleDeleteSubscription cancels a flat-fee subscription.
+// handleDeleteSubscription cancels a flat-fee subscription. It is marked
+// cancelled (not removed) so the next invoice can bill the prorated partial
+// period and list it as cancelled; the invoice then drops it.
 func (s *Service) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sid := r.PathValue("sid")
 	s.mu.Lock()
-	delete(s.subs[id], sid)
+	if st := s.subs[id][sid]; st != nil {
+		st.Cancelled = true
+	}
 	s.mu.Unlock()
 	s.log.Info("subscription cancelled", "customer", id, "subscription", sid)
 	w.WriteHeader(http.StatusNoContent)
