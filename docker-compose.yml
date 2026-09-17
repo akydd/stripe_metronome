@@ -32,13 +32,16 @@ services:
         limits:
           memory: 1024M
 
-  # Web UI for observing topics and messages as they propagate.
+  # Web UI for observing topics and messages as they propagate. Its UI can create
+  # and delete topics, so it is bound to localhost only (reach it with an SSH
+  # tunnel: `ssh -L 8080:localhost:8080 <host>`). Public, read-only event viewing
+  # is served instead by the eventfeed service via the frontend.
   console:
     image: docker.redpanda.com/redpandadata/console:latest
     environment:
       KAFKA_BROKERS: redpanda:9092
     ports:
-      - "8080:8080"                # http://<host>:8080
+      - "127.0.0.1:8080:8080"      # localhost only — not exposed publicly
     depends_on:
       redpanda:
         condition: service_healthy
@@ -168,6 +171,27 @@ services:
         limits:
           memory: 64M
 
+  # Read-only live event feed: tails every Kafka topic into a bounded buffer and
+  # serves it to the frontend. Consumes only (no produce path), so it is safe to
+  # expose publicly — this is the recruiter-facing way to watch events flow.
+  eventfeed:
+    build:
+      context: .
+      args:
+        SERVICE: eventfeed
+    environment:
+      BUS: kafka
+      KAFKA_SEEDS: redpanda:9092
+      EVENTFEED_HTTP_ADDR: ":8086"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
   # React frontend + reverse proxy to the billing API.
   web:
     build:
@@ -178,6 +202,7 @@ services:
       - billing
       - controlplane
       - metering
+      - eventfeed
     restart: unless-stopped
     deploy:
       resources:

@@ -151,3 +151,27 @@ export async function getUpcomingInvoice(customerId: string): Promise<UpcomingIn
 export async function getInvoices(customerId: string): Promise<Invoice[]> {
   return asJSON<Invoice[]>(await fetch(`/v1/customers/${customerId}/invoices`))
 }
+
+// --- live event feed (read-only) ---
+
+export interface EventEntry {
+  seq: number
+  topic: string
+  partition: number
+  offset: number
+  timestamp: string
+  customer_id?: string
+  type?: string
+  payload?: unknown
+}
+
+export interface EventsResponse {
+  events: EventEntry[] // ascending seq order (oldest first)
+  last_seq: number
+}
+
+// getEvents returns buffered events with seq greater than `since` (0 = the whole
+// buffer), plus the newest seq to poll from next.
+export async function getEvents(since = 0): Promise<EventsResponse> {
+  return asJSON<EventsResponse>(await fetch(`/v1/events?since=${since}`))
+}

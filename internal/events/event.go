@@ -50,3 +50,18 @@ func NewID() string {
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
+
+// AllTypes returns every domain event type in a stable order. It is the single
+// source of truth for "all topics" — e.g. the eventfeed tails exactly these, so
+// adding an event type here makes it appear in the live feed automatically.
+func AllTypes() []Type {
+	return []Type{
+		UsageIngested,
+		SubscriptionActivated,
+		SubscriptionCancelled,
+		BillingCycleEnded,
+		InvoiceFinalized,
+		PaymentSucceeded,
+		PaymentFailed,
+	}
+}

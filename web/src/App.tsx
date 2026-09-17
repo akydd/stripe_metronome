@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import {
   Customer,
+  EventEntry,
   GeneratorProcess,
   GeneratorType,
   Invoice,
@@ -10,6 +11,7 @@ import {
   createCustomer,
   deleteGenerator,
   emitLate,
+  getEvents,
   getInvoices,
   getSubscriptionPlan,
   getUpcomingInvoice,
@@ -59,6 +61,145 @@ function InvoiceLines({ lines, totalCents }: { lines: InvoiceLine[]; totalCents:
         </tr>
       </tbody>
     </table>
+  )
+}
+
+// Bootstrap badge class per event topic, so the feed is scannable by color.
+const TOPIC_BADGE: Record<string, string> = {
+  'usage.ingested': 'text-bg-info',
+  'subscription.activated': 'text-bg-primary',
+  'subscription.cancelled': 'text-bg-secondary',
+  'billing_cycle.ended': 'text-bg-warning',
+  'invoice.finalized': 'text-bg-primary',
+  'payment.succeeded': 'text-bg-success',
+  'payment.failed': 'text-bg-danger',
+}
+const ALL_TOPICS = Object.keys(TOPIC_BADGE)
+const MAX_ROWS = 200
+
+// LiveEvents shows events as they flow across the Kafka bus, read from the
+// eventfeed service. It polls independently of the main console refresh so a
+// recruiter can watch events stream in — with the broker partition/offset shown
+// as proof they really traversed Kafka.
+function LiveEvents() {
+  const [events, setEvents] = useState<EventEntry[]>([])
+  const [paused, setPaused] = useState(false)
+  const [filter, setFilter] = useState('')
+  const [expanded, setExpanded] = useState<number | null>(null)
+  const lastSeq = useRef(0)
+  const pausedRef = useRef(paused)
+
+  useEffect(() => {
+    pausedRef.current = paused
+  }, [paused])
+
+  useEffect(() => {
+    async function tick() {
+      if (pausedRef.current) return
+      try {
+        const res = await getEvents(lastSeq.current)
+        if (res.last_seq > lastSeq.current) lastSeq.current = res.last_seq
+        if (res.events.length > 0) {
+          // Server returns oldest→newest; show newest on top.
+          const incoming = [...res.events].reverse()
+          setEvents((prev) => [...incoming, ...prev].slice(0, MAX_ROWS))
+        }
+      } catch {
+        /* ignore transient errors; next tick retries */
+      }
+    }
+    tick()
+    const t = setInterval(tick, 1500)
+    return () => clearInterval(t)
+  }, [])
+
+  const shown = filter ? events.filter((e) => e.topic === filter) : events
+  const fmtTime = (ts: string) => new Date(ts).toLocaleTimeString()
+
+  return (
+    <>
+      <h2 className="h5 mt-4">Live events</h2>
+      <p className="text-secondary small mb-2">
+        Read-only tail of the Kafka bus (via the eventfeed service). Each row shows the broker
+        partition:offset — proof the event really flowed through Redpanda, not the browser.
+      </p>
+      <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
+        <button
+          className={`btn btn-sm ${paused ? 'btn-outline-success' : 'btn-outline-secondary'}`}
+          onClick={() => setPaused((p) => !p)}
+        >
+          {paused ? '▶ Resume' : '⏸ Pause'}
+        </button>
+        <select
+          className="form-select form-select-sm w-auto"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        >
+          <option value="">all topics</option>
+          {ALL_TOPICS.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+        <span className="text-secondary small">
+          {shown.length} shown{paused ? ' · paused' : ''}
+        </span>
+      </div>
+      <div className="table-responsive" style={{ maxHeight: 360, overflowY: 'auto' }}>
+        <table className="table table-sm align-middle mb-0">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Topic</th>
+              <th>Customer</th>
+              <th className="text-end">part:offset</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {shown.length === 0 && (
+              <tr>
+                <td colSpan={5} className="text-secondary">
+                  Waiting for events — start a generator above.
+                </td>
+              </tr>
+            )}
+            {shown.map((e) => (
+              <Fragment key={e.seq}>
+                <tr
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => setExpanded((x) => (x === e.seq ? null : e.seq))}
+                >
+                  <td className="text-secondary small">{fmtTime(e.timestamp)}</td>
+                  <td>
+                    <span className={`badge ${TOPIC_BADGE[e.topic] ?? 'text-bg-secondary'}`}>
+                      {e.topic}
+                    </span>
+                  </td>
+                  <td>
+                    <code className="small">{e.customer_id || '—'}</code>
+                  </td>
+                  <td className="text-end text-secondary small">
+                    {e.partition}:{e.offset}
+                  </td>
+                  <td className="text-secondary small">{expanded === e.seq ? '▾' : '▸'}</td>
+                </tr>
+                {expanded === e.seq && (
+                  <tr>
+                    <td colSpan={5}>
+                      <pre className="small mb-0 p-2 bg-body-tertiary rounded">
+                        {JSON.stringify(e.payload ?? {}, null, 2)}
+                      </pre>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   )
 }
 
@@ -466,6 +607,9 @@ export function App() {
           </tbody>
         </table>
       </div>
+
+      {/* Live event feed */}
+      <LiveEvents />
     </div>
   )
 }

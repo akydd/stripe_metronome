@@ -24,6 +24,7 @@ billing` for customer validation).
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs) mirror real endpoints. `close-period` is a **demo shim** (real Metronome has no such call). Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
 | `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for *generator processes* (`/v1/generators`). Two types: **usage** (ticks → publishes `usage.ingested`) and **subscription** (flat fee; start/stop → `subscription.activated`/`cancelled`). Frontend calls it directly. |
+| `eventfeed` | `cmd/eventfeed`   | `:8086`  | **Read-only** live view of the bus. Tails every event topic into a bounded in-memory ring (last ~500) and serves it at `GET /v1/events` for the frontend's **Live events** panel. Consumes only — no produce path — so it is safe to expose publicly (this is the recruiter-facing way to watch events, in place of the Console). |
 
 Override a listen address with `<SERVICE>_HTTP_ADDR` (e.g. `BILLING_HTTP_ADDR`).
 
@@ -71,7 +72,11 @@ name. Two `Bus` implementations sit behind one interface:
 - `InMemoryBus` (`bus.go`) — single-process local dev / tests (`BUS=memory`, default).
 - `KafkaBus` (`kafka.go`, franz-go) — cross-process via a Kafka-API broker
   (`BUS=kafka`, `KAFKA_SEEDS=...`). The Docker stack runs **Redpanda** as the
-  broker and **Redpanda Console** as a UI for watching messages propagate.
+  broker. Two ways to watch messages propagate:
+  - **Live events** panel in the web app — a read-only tail served by the
+    `eventfeed` service (`GET /v1/events`), safe to expose publicly.
+  - **Redpanda Console** — a fuller UI, but its buttons can create/delete topics,
+    so it is bound to **localhost only** (reach it with an SSH tunnel).
 
 ## Layout
 
@@ -118,8 +123,11 @@ docker compose up --build
 
 Then open:
 
-- **App**: <http://localhost/>
-- **Redpanda Console** (watch events flow): <http://localhost:8080>
+- **App**: <http://localhost/> — includes a **Live events** panel (read-only tail
+  of the bus, served by `eventfeed`).
+- **Redpanda Console** (fuller UI): <http://localhost:8080> — bound to localhost
+  only. On a remote host, reach it with an SSH tunnel:
+  `ssh -L 8080:localhost:8080 <host>`.
 
 ### Watch the billing lifecycle
 
@@ -143,8 +151,8 @@ ID=$(curl -s -X POST http://localhost/v1/generators \
 curl -X POST http://localhost/v1/generators/$ID/start
 ```
 
-Watch `usage.ingested` populate in the Console. Stop it anytime:
-`curl -X POST http://localhost/v1/generators/$ID/stop`.
+Watch `usage.ingested` populate in the app's **Live events** panel (or the
+Console). Stop it anytime: `curl -X POST http://localhost/v1/generators/$ID/stop`.
 
 **3. Check the mid-cycle invoice** (the thing Stripe alone can't show) — the
 `invoicing` service reads priced usage from Metronome (list-costs) + active
@@ -164,7 +172,8 @@ curl http://localhost/v1/customers/$CUST/upcoming-invoice
 curl -X POST http://localhost/v1/billing-cycles/$CUST/close
 ```
 
-Watch the invoicing chain light up in the Console, each hop on its own topic:
+Watch the invoicing chain light up in the **Live events** panel (or the Console),
+each hop on its own topic:
 
 ```
 billing_cycle.ended → (invoicing queries metering) → invoice.finalized → payment.succeeded
@@ -316,8 +325,10 @@ directory's README. To do it by hand instead, on the instance:
 1. Add swap for headroom: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
 2. Install Docker + the compose plugin.
 3. `docker compose up --build -d`.
-4. Security group inbound: `80` (app) and `8080` (Console). Leave `19092` closed
-   unless you need external Kafka tooling.
+4. Security group inbound: only `80` (app). Recruiters watch events via the app's
+   read-only **Live events** panel. The Console is bound to localhost, so leave
+   `8080` closed and reach it with an SSH tunnel (`ssh -L 8080:localhost:8080`);
+   leave `19092` (Kafka) closed too unless you need external tooling.
 
 Cost note: the T4g trial covers the compute, but a **public IPv4 address bills
 ~$3.60/month** even while attached; use IPv6-only or your free-tier credits to
