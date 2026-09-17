@@ -203,6 +203,96 @@ function LiveEvents() {
   )
 }
 
+// HowToDemo is a dismissible notes card explaining the two headline demos. The
+// dismissed state is remembered per browser so it doesn't nag on every visit.
+function HowToDemo() {
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return localStorage.getItem('howtoDismissed') === '1'
+    } catch {
+      return false
+    }
+  })
+  if (dismissed) return null
+  const dismiss = () => {
+    setDismissed(true)
+    try {
+      localStorage.setItem('howtoDismissed', '1')
+    } catch {
+      /* ignore */
+    }
+  }
+  return (
+    <div className="card mb-4">
+      <div className="card-body">
+        <div className="d-flex justify-content-between align-items-start">
+          <h2 className="h5 mb-2">How this demo works</h2>
+          <button className="btn-close" aria-label="Dismiss" onClick={dismiss} />
+        </div>
+        <p className="mb-3">
+          Usage is metered in <strong>Metronome</strong> and invoiced by <strong>Stripe</strong>{' '}
+          (both local stand-ins), wired together over a <strong>Kafka</strong> (Redpanda) event bus.
+          Provision <em>generators</em> for a customer to simulate activity, then watch billing
+          react. Every event is visible live in the <strong>Live events</strong> panel at the bottom
+          of the page.
+        </p>
+
+        <p className="mb-1">
+          <strong>Demo 1 — Live mid-cycle usage</strong>{' '}
+          <span className="text-secondary">(the thing Stripe alone can't show)</span>
+        </p>
+        <ol className="mb-3">
+          <li>
+            In <strong>Customers</strong>, enter a name and click <strong>Create customer</strong>.
+          </li>
+          <li>
+            In <strong>Generators</strong>, select that customer, choose <strong>usage-based</strong>
+            , and click <strong>Provision generator</strong> — then click <strong>Start</strong>.
+          </li>
+          <li>
+            Click <strong>Mid-cycle</strong> on the customer's row and leave it open. The preview
+            refreshes as usage is metered, so the amount climbs in real time — priced per generator
+            at sub-cent precision, before any invoice is finalized.
+          </li>
+          <li>
+            <em>(Optional)</em> Also provision a <strong>flat-fee subscription</strong> generator and{' '}
+            <strong>Start</strong> it — the mid-cycle preview now adds a <em>prorated</em>{' '}
+            subscription line ($25 of the $50 plan) on top of usage.
+          </li>
+        </ol>
+
+        <p className="mb-1">
+          <strong>Demo 2 — Late usage rolls into the current cycle</strong>
+        </p>
+        <p className="mb-1">
+          <em>Late usage</em> = events timestamped <strong>before the current billing period began</strong>{' '}
+          (they belong to a period that already closed). Rather than dropping them or reopening the
+          closed invoice, the system rolls them forward into the current cycle as a separate line.
+        </p>
+        <ol className="mb-2">
+          <li>
+            With a usage generator running (from Demo 1), click <strong>Close cycle</strong>. This
+            finalizes the first invoice and starts a fresh period — the boundary that defines "late."
+          </li>
+          <li>
+            Click <strong>Emit late</strong> a few times on that generator. Those events are
+            backdated to <em>before</em> the new period began.
+          </li>
+          <li>
+            Click <strong>Mid-cycle</strong> again. A distinct <strong>"Late usage"</strong> line now
+            appears alongside the current period's on-time <strong>API requests</strong> — the late
+            events billed in the current cycle, not the closed one.
+          </li>
+        </ol>
+        <p className="text-secondary small mb-0">
+          Lateness is determined by the metering service from each event's timestamp versus the
+          period boundary — the sender never marks an event as late.
+        </p>
+      </div>
+    </div>
+  )
+}
+
 export function App() {
   const [customers, setCustomers] = useState<Customer[]>([])
   const [procs, setProcs] = useState<GeneratorProcess[]>([])
@@ -324,10 +414,16 @@ export function App() {
           {theme === 'dark' ? '☀ Light' : '🌙 Dark'}
         </button>
       </div>
-      <p className="text-secondary">
+      <p className="text-secondary mb-1">
         Metronome + Stripe demo — provision usage &amp; subscription generators, then close a cycle
         to invoice.
       </p>
+      <p className="text-secondary small">
+        <span className="badge text-bg-secondary">note</span> All demo data resets daily at{' '}
+        <strong>00:00 UTC</strong>.
+      </p>
+
+      <HowToDemo />
 
       {error && <div className="alert alert-danger py-2">{error}</div>}
 

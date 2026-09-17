@@ -76,7 +76,8 @@ name. Two `Bus` implementations sit behind one interface:
   - **Live events** panel in the web app — a read-only tail served by the
     `eventfeed` service (`GET /v1/events`), safe to expose publicly.
   - **Redpanda Console** — a fuller UI, but its buttons can create/delete topics,
-    so it is bound to **localhost only** (reach it with an SSH tunnel).
+    so it is bound to **localhost only** (reach it via SSM port forwarding when
+    deployed; see the Terraform `console_tunnel` output).
 
 ## Layout
 
@@ -126,8 +127,9 @@ Then open:
 - **App**: <http://localhost/> — includes a **Live events** panel (read-only tail
   of the bus, served by `eventfeed`).
 - **Redpanda Console** (fuller UI): <http://localhost:8080> — bound to localhost
-  only. On a remote host, reach it with an SSH tunnel:
-  `ssh -L 8080:localhost:8080 <host>`.
+  only. On the deployed instance it isn't exposed publicly; reach it by forwarding
+  its port over AWS SSM (see the Terraform `console_tunnel` output), then open
+  <http://localhost:8080>.
 
 ### Watch the billing lifecycle
 
@@ -329,17 +331,19 @@ events, and uses one hardcoded rate instead of configured rate cards.
 The stack is memory-tuned for a 2 GB `t4g.small` (free via the EC2 T4g trial
 through Dec 31 2026 — 750 hrs/month ≈ one always-on instance).
 
-**Terraform** (`infra/terraform/`) provisions the instance, security group, swap,
-and Docker, and can self-deploy on boot (clone + `docker compose up`). See that
-directory's README. To do it by hand instead, on the instance:
+**Terraform** (`infra/terraform/`) provisions the instance, security group, IAM
+role, swap, and Docker, and can self-deploy on boot (clone + `docker compose up`).
+Management is via **AWS SSM (Session Manager)** — no SSH, no key pair, and no
+dependency on a static IP. See that directory's README. To do it by hand instead,
+on the instance:
 
 1. Add swap for headroom: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`.
 2. Install Docker + the compose plugin.
 3. `docker compose up --build -d`.
 4. Security group inbound: only `80` (app). Recruiters watch events via the app's
-   read-only **Live events** panel. The Console is bound to localhost, so leave
-   `8080` closed and reach it with an SSH tunnel (`ssh -L 8080:localhost:8080`);
-   leave `19092` (Kafka) closed too unless you need external tooling.
+   read-only **Live events** panel. The Console is bound to localhost — reach it by
+   forwarding its port over SSM (`console_tunnel` output); leave `19092` (Kafka)
+   closed too unless you need external tooling.
 
 Cost note: the T4g trial covers the compute, but a **public IPv4 address bills
 ~$3.60/month** even while attached; use IPv6-only or your free-tier credits to
