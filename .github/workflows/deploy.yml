@@ -1,0 +1,98 @@
+name: Deploy
+
+# Continuous deployment to the SSM-managed EC2 instance. On push to main (after a
+# quick build check), assume an AWS role via OIDC and send one SSM command telling
+# the box to pull the latest code and rebuild the stack. No SSH, no stored keys.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required to request the OIDC token
+
+env:
+  AWS_REGION: ca-central-1
+  INSTANCE_TAG: stripe-metronome-demo
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go build ./...
+      - run: go vet ./...
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve target instance
+        id: ec2
+        run: |
+          IID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${INSTANCE_TAG}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          if [ -z "$IID" ] || [ "$IID" = "None" ]; then
+            echo "::error::no running instance tagged Name=${INSTANCE_TAG}"; exit 1
+          fi
+          echo "id=$IID" >> "$GITHUB_OUTPUT"
+          echo "Deploying to $IID"
+
+      - name: Send deploy command (SSM)
+        id: send
+        run: |
+          CID=$(aws ssm send-command \
+            --instance-ids "${{ steps.ec2.outputs.id }}" \
+            --document-name AWS-RunShellScript \
+            --comment "GHA deploy ${GITHUB_SHA::7}" \
+            --parameters '{"commands":[
+              "set -euo pipefail",
+              "cd /home/ec2-user/app",
+              "runuser -u ec2-user -- git fetch --prune origin",
+              "runuser -u ec2-user -- git reset --hard origin/main",
+              "docker compose up --build -d --remove-orphans",
+              "docker compose restart web",
+              "docker compose ps"
+            ]}' \
+            --query Command.CommandId --output text)
+          echo "cid=$CID" >> "$GITHUB_OUTPUT"
+          echo "SSM command: $CID"
+
+      - name: Wait for the deploy to finish
+        run: |
+          CID="${{ steps.send.outputs.cid }}"
+          IID="${{ steps.ec2.outputs.id }}"
+          for i in $(seq 1 80); do
+            ST=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" \
+                  --query Status --output text 2>/dev/null || echo Pending)
+            echo "status: $ST"
+            case "$ST" in
+              Success) OK=1; break;;
+              Failed|Cancelled|TimedOut)
+                echo "::error::deploy command $ST";
+                aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" \
+                  --query StandardErrorContent --output text;
+                exit 1;;
+            esac
+            sleep 15
+          done
+          echo "----- deploy output -----"
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$IID" \
+            --query StandardOutputContent --output text
+          if [ "${OK:-0}" != "1" ]; then echo "::error::timed out waiting for deploy"; exit 1; fi

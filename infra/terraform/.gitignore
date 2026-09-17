@@ -1,0 +1,11 @@
+# Local Terraform state & settings — never commit these.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Your actual variable values (may contain environment-specific settings).
+terraform.tfvars
+*.auto.tfvars
+*~

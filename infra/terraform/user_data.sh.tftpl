@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euxo pipefail
+
+# --- 2 GB swap (headroom for the memory-tuned stack) ---
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# --- Docker + git + cron ---
+dnf install -y docker git cronie
+systemctl enable --now docker
+systemctl enable --now crond
+usermod -aG docker ec2-user
+
+# --- Docker Compose plugin (arm64) ---
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-aarch64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# --- Docker Buildx plugin (arm64) — Compose v2 requires it to build images ---
+BUILDX_VER=$(curl -fsSL https://api.github.com/repos/docker/buildx/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+curl -fsSL "https://github.com/docker/buildx/releases/download/$${BUILDX_VER}/buildx-$${BUILDX_VER}.linux-arm64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-buildx
+chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+
+# --- Daily reset: wipe demo state back to a pristine slate at 00:00 UTC ---
+# The stack keeps all state in memory + the broker's writable layer (no named
+# volumes), so `down` + `up` clears every customer, generator, topic and message.
+# AL2023 runs on UTC, so `0 0 * * *` fires at 00:00 UTC.
+cat > /usr/local/bin/reset-demo.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -f /home/ec2-user/app/stripe_metronome/docker-compose.yml ]; then
+  cd /home/ec2-user/app/stripe_metronome
+elif [ -f /home/ec2-user/app/docker-compose.yml ]; then
+  cd /home/ec2-user/app
+else
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') reset-demo: compose dir not found" >&2
+  exit 1
+fi
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') reset-demo: recreating stack in $(pwd)"
+docker compose down --remove-orphans
+docker compose up -d
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') reset-demo: done"
+EOF
+chmod +x /usr/local/bin/reset-demo.sh
+
+cat > /etc/cron.d/reset-demo <<'EOF'
+# Reset the demo to a clean slate every day at 00:00 UTC.
+0 0 * * * root /usr/local/bin/reset-demo.sh >> /var/log/reset-demo.log 2>&1
+EOF
+chmod 644 /etc/cron.d/reset-demo
+
+# --- Optional: clone the repo and bring the stack up ---
+REPO_URL="${repo_url}"
+if [ -n "$REPO_URL" ]; then
+  cd /home/ec2-user
+  sudo -u ec2-user git clone "$REPO_URL" app
+  # The compose file lives at stripe_metronome/ if the repo root is one level up,
+  # otherwise at the repo root. Handle both.
+  if [ -f app/stripe_metronome/docker-compose.yml ]; then
+    cd app/stripe_metronome
+  else
+    cd app
+  fi
+  docker compose up --build -d
+fi

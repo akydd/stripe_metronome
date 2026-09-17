@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and fill in. All vars have defaults, so this is
+# optional — you can also just `terraform apply` with no tfvars.
+
+region = "us-east-1"
+
+# Optional: clone + deploy on boot. Requires the repo to be pushed somewhere the
+# instance can reach (public repo, or add a deploy key / use HTTPS with a token).
+# Leave empty to just install Docker + swap and deploy manually.
+# repo_url = "https://github.com/akydd/stripe_metronome.git"
+
+# Access: there is NO SSH and no key pair. The instance is managed via AWS SSM
+# (Session Manager) — only port 80 (the app, incl. the read-only Live events
+# feed) is exposed. Shell in with the `ssm_session` output; reach the
+# localhost-bound Redpanda Console with the `console_tunnel` output. Both need
+# the AWS CLI Session Manager plugin installed locally.
