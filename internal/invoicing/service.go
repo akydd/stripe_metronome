@@ -105,9 +105,9 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		if sub.ProratedCents <= 0 {
 			continue
 		}
-		desc := "Subscription (prorated)"
+		desc := "Flat-fee Subscription (prorated)"
 		if sub.Cancelled {
-			desc = "Subscription (cancelled, prorated)"
+			desc = "Flat-fee Subscription (cancelled, prorated)"
 		}
 		lines = append(lines, map[string]any{
 			"description":   desc,
@@ -160,12 +160,12 @@ type usageGroup struct {
 	UsageMicros     int64             `json:"usage_micros"`
 }
 
-// usageDesc builds an invoice line description from a group's dimensions. The
-// "late" dimension is surfaced as a distinct "Late usage" line.
+// usageDesc builds an invoice line description from a group's dimensions. Late
+// usage (the "late" dimension) is surfaced by appending "(late)" to the label.
 func usageDesc(dims map[string]string, period int) string {
-	label := "API requests"
+	label := "Usage-based Billing"
 	if dims["late"] == "true" {
-		label = "Late usage"
+		label += " (late)"
 	}
 	suffix := ""
 	if period >= 0 { // mid-cycle (list-costs) has no period; finalized invoices do

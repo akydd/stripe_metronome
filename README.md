@@ -163,7 +163,7 @@ subscriptions and previews what would be billed:
 ```sh
 curl http://localhost/v1/customers/$CUST/upcoming-invoice
 # {"amount_cents":9,"amount_micros":90000,"lines":[
-#   {"description":"API requests · gen 1a2b3c4d","quantity":900,"amount_micros":90000,"unit_price_micros":100}],
+#   {"description":"Usage-based Billing · gen 1a2b3c4d","quantity":900,"amount_micros":90000,"unit_price_micros":100}],
 #  "upcoming":true,...}
 ```
 
@@ -187,7 +187,7 @@ real; only the provider APIs themselves are stubbed. The usage rate is a hardcod
 are skipped (no invoice).
 
 **Hybrid billing:** provision a **subscription** generator too and start it — then
-close the cycle. The invoice carries both a usage line (`API requests · gen … (period N)`)
+close the cycle. The invoice carries both a usage line (`Usage-based Billing · gen … (period N)`)
 and a subscription line, because **Stripe** manages the flat-fee subscription and
 adds it when it creates the invoice, alongside the metered-usage items the
 `invoicing` service pulled from Metronome. The subscription price is a **fixed plan
@@ -203,12 +203,13 @@ curl -s -X POST http://localhost/v1/generators \
 **5. Late-arriving usage:** the `emit` endpoint **backdates** usage timestamps to
 simulate usage that occurred before the current period started (works even for a
 stopped generator). The `metering` service flags it late (`occurred_at <
-period_start`), so it bills as its own **`Late usage`** line on the next invoice —
-separate from on-time usage. (Close a cycle first so a period boundary exists.)
+period_start`), so it bills as its own **`Usage-based Billing (late)`** line on
+the next invoice — separate from on-time usage. (Close a cycle first so a period
+boundary exists.)
 
 ```sh
 curl -X POST "http://localhost/v1/generators/$ID/emit?count=2000"   # backdated -> late
-curl -X POST http://localhost/v1/billing-cycles/$CUST/close          # bills as a "Late usage" line
+curl -X POST http://localhost/v1/billing-cycles/$CUST/close          # bills as a "Usage-based Billing (late)" line
 ```
 
 **Payment failure branch:** a customer whose id contains `fail` doesn't pay (e.g.
@@ -251,8 +252,8 @@ requests") so sub-cent amounts rarely arise — is not used here; this project k
 the fine-grained per-request unit and relies on precise summation instead.
 
 **Subscription proration.** On the **mid-cycle preview**, a flat-fee subscription
-is shown *prorated* for the partial period — a `Subscription (prorated)` line at a
-default **$25** (vs the **$50** full-period plan price), with a note in the UI
+is shown *prorated* for the partial period — a `Flat-fee Subscription (prorated)`
+line at a default **$25** (vs the **$50** full-period plan price), with a note in the UI
 (`subscription_prorated` in the response). The **finalized invoice** at cycle close
 bills the **full period** ($50). Stripe owns the amounts (`fakestripe` exposes both
 `amount_cents` and `prorated_cents`); `invoicing` just picks the prorated one for
@@ -266,17 +267,17 @@ a new subscription must be provisioned in its place (`controlplane` rejects a
 restart with `409`, and `fakestripe` rejects re-registering the same id). The
 cancelled subscription is **not** dropped immediately: it stays until the next
 invoice, which bills it at the **prorated** amount for the partial period it was
-active and lists it as `Subscription … (cancelled, prorated)`, then removes it (so
-it never bills again). An **active** subscription, by contrast, bills the full
-period at close. The mid-cycle preview reflects the pending cancellation, showing
-the sub as `Subscription (cancelled, prorated)`.
+active and lists it as `Flat-fee Subscription (cancelled, prorated)`, then removes
+it (so it never bills again). An **active** subscription, by contrast, bills the
+full period at close. The mid-cycle preview reflects the pending cancellation,
+showing the sub as `Flat-fee Subscription (cancelled, prorated)`.
 
 ## Late-arriving usage
 
 "Late" usage is usage whose event timestamp falls **before the customer's current
 billing period began** — i.e. it belongs to a period that already closed but was
-reported afterward. It's surfaced as its own invoice line (`Late usage · …`),
-separate from on-time usage.
+reported afterward. It's surfaced as its own invoice line
+(`Usage-based Billing (late) · …`), separate from on-time usage.
 
 Two design rules make this faithful to how you'd build it on real Metronome:
 

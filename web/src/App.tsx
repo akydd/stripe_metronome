@@ -279,9 +279,10 @@ function HowToDemo() {
             backdated to <em>before</em> the new period began.
           </li>
           <li>
-            Click <strong>Mid-cycle</strong> again. A distinct <strong>"Late usage"</strong> line now
-            appears alongside the current period's on-time <strong>API requests</strong> — the late
-            events billed in the current cycle, not the closed one.
+            Click <strong>Mid-cycle</strong> again. A distinct{' '}
+            <strong>"Usage-based Billing (late)"</strong> line now appears alongside the current
+            period's on-time <strong>"Usage-based Billing"</strong> — the late events billed in
+            the current cycle, not the closed one.
           </li>
         </ol>
         <p className="text-secondary small mb-0">

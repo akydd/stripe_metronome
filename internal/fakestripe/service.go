@@ -153,10 +153,10 @@ func (s *Service) handleCreateInvoice(w http.ResponseWriter, r *http.Request) {
 	// Prices are stored in cents; convert to micros for the line.
 	for sid, st := range s.subs[req.Customer] {
 		cents := st.AmountCents
-		desc := "Subscription " + sid
+		desc := "Flat-fee Subscription"
 		if st.Cancelled {
 			cents = proratedCents(st.AmountCents)
-			desc = "Subscription " + sid + " (cancelled, prorated)"
+			desc = "Flat-fee Subscription (cancelled, prorated)"
 			delete(s.subs[req.Customer], sid) // final billing — remove it
 		}
 		lines = append(lines, line{
