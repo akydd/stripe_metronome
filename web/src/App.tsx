@@ -3,12 +3,14 @@ import {
   Customer,
   EventEntry,
   GeneratorProcess,
-  GeneratorType,
   Invoice,
   InvoiceLine,
+  Subscription,
   UpcomingInvoice,
+  cancelSubscription,
   closeCycle,
   createCustomer,
+  createSubscription,
   deleteGenerator,
   emitLate,
   getEvents,
@@ -17,6 +19,7 @@ import {
   getUpcomingInvoice,
   listCustomers,
   listGenerators,
+  listSubscriptions,
   provisionGenerator,
   startGenerator,
   stopGenerator,
@@ -67,7 +70,7 @@ function InvoiceLines({ lines, totalCents }: { lines: InvoiceLine[]; totalCents:
 // Bootstrap badge class per event topic, so the feed is scannable by color.
 const TOPIC_BADGE: Record<string, string> = {
   'usage.ingested': 'text-bg-info',
-  'subscription.activated': 'text-bg-primary',
+  'subscription.created': 'text-bg-primary',
   'subscription.cancelled': 'text-bg-secondary',
   'billing_cycle.ended': 'text-bg-warning',
   'invoice.finalized': 'text-bg-primary',
@@ -246,8 +249,8 @@ function HowToDemo() {
             In <strong>Customers</strong>, enter a name and click <strong>Create customer</strong>.
           </li>
           <li>
-            In <strong>Generators</strong>, select that customer, choose <strong>usage-based</strong>
-            , and click <strong>Provision generator</strong> — then click <strong>Start</strong>.
+            In <strong>Generators</strong>, select that customer, click{' '}
+            <strong>Provision generator</strong>, then click <strong>Start</strong>.
           </li>
           <li>
             Click <strong>Mid-cycle</strong> on the customer's row and leave it open. The preview
@@ -255,9 +258,9 @@ function HowToDemo() {
             at sub-cent precision, before any invoice is finalized.
           </li>
           <li>
-            <em>(Optional)</em> Also provision a <strong>flat-fee subscription</strong> generator and{' '}
-            <strong>Start</strong> it — the mid-cycle preview now adds a <em>prorated</em>{' '}
-            subscription line ($25 of the $50 plan) on top of usage.
+            <em>(Optional)</em> In <strong>Subscriptions</strong>, pick that customer and click{' '}
+            <strong>Add subscription</strong> — the mid-cycle preview now adds a <em>prorated</em>{' '}
+            flat-fee line ($25 of the $50 plan) on top of usage.
           </li>
         </ol>
 
@@ -297,9 +300,9 @@ function HowToDemo() {
 export function App() {
   const [customers, setCustomers] = useState<Customer[]>([])
   const [procs, setProcs] = useState<GeneratorProcess[]>([])
+  const [subs, setSubs] = useState<Subscription[]>([])
   const [newName, setNewName] = useState('Acme Inc')
   const [selected, setSelected] = useState('')
-  const [genType, setGenType] = useState<GeneratorType>('usage')
   const [intervalMs, setIntervalMs] = useState(1000)
   const [perTick, setPerTick] = useState(10)
   const [planCents, setPlanCents] = useState<number | null>(null)
@@ -349,6 +352,29 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Poll the selected customer's flat-fee subscriptions (owned by invoicing).
+  useEffect(() => {
+    if (!selected) {
+      setSubs([])
+      return
+    }
+    let stop = false
+    const load = () =>
+      listSubscriptions(selected)
+        .then((s) => {
+          if (!stop) setSubs(s)
+        })
+        .catch(() => {
+          if (!stop) setSubs([])
+        })
+    load()
+    const t = setInterval(load, 3000)
+    return () => {
+      stop = true
+      clearInterval(t)
+    }
+  }, [selected])
+
   // Auto-refresh the open invoice view so live mid-cycle data updates on its own.
   useEffect(() => {
     if (!view) return
@@ -368,6 +394,17 @@ export function App() {
     try {
       await action()
       await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // Like run(), but reloads the selected customer's subscriptions afterward.
+  async function runSub(action: () => Promise<unknown>) {
+    try {
+      await action()
+      if (selected) setSubs(await listSubscriptions(selected))
+      setError(null)
     } catch (e) {
       setError(String(e))
     }
@@ -416,8 +453,8 @@ export function App() {
         </button>
       </div>
       <p className="text-secondary mb-1">
-        Metronome + Stripe demo — provision usage &amp; subscription generators, then close a cycle
-        to invoice.
+        Metronome + Stripe demo — provision usage generators and flat-fee subscriptions, then close
+        a cycle to invoice.
       </p>
       <p className="text-secondary small">
         <span className="badge text-bg-secondary">note</span> All demo data resets daily at{' '}
@@ -560,7 +597,7 @@ export function App() {
         </div>
       )}
 
-      {/* Generators */}
+      {/* Generators (usage-based) */}
       <h2 className="h5 mt-4">Generators</h2>
       <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
         <select
@@ -575,57 +612,34 @@ export function App() {
             </option>
           ))}
         </select>
-        <select
-          className="form-select form-select-sm w-auto"
-          value={genType}
-          onChange={(e) => setGenType(e.target.value as GeneratorType)}
-        >
-          <option value="usage">usage-based</option>
-          <option value="subscription">flat-fee subscription</option>
-        </select>
-        {genType === 'subscription' && (
-          <span className="text-secondary small">fixed plan price: {planLabel}</span>
-        )}
-        {genType === 'usage' && (
-          <>
-            <div className="input-group input-group-sm w-auto">
-              <span className="input-group-text">every</span>
-              <input
-                type="number"
-                className="form-control"
-                style={{ width: 90 }}
-                min={10}
-                value={intervalMs}
-                onChange={(e) => setIntervalMs(Number(e.target.value))}
-              />
-              <span className="input-group-text">ms ×</span>
-              <input
-                type="number"
-                className="form-control"
-                style={{ width: 80 }}
-                min={1}
-                value={perTick}
-                onChange={(e) => setPerTick(Number(e.target.value))}
-              />
-              <span className="input-group-text">events</span>
-            </div>
-            <span className="text-secondary small">
-              ≈ {intervalMs > 0 ? Math.round((perTick * 1000) / intervalMs) : 0}/s
-            </span>
-          </>
-        )}
+        <div className="input-group input-group-sm w-auto">
+          <span className="input-group-text">every</span>
+          <input
+            type="number"
+            className="form-control"
+            style={{ width: 90 }}
+            min={10}
+            value={intervalMs}
+            onChange={(e) => setIntervalMs(Number(e.target.value))}
+          />
+          <span className="input-group-text">ms ×</span>
+          <input
+            type="number"
+            className="form-control"
+            style={{ width: 80 }}
+            min={1}
+            value={perTick}
+            onChange={(e) => setPerTick(Number(e.target.value))}
+          />
+          <span className="input-group-text">events</span>
+        </div>
+        <span className="text-secondary small">
+          ≈ {intervalMs > 0 ? Math.round((perTick * 1000) / intervalMs) : 0}/s
+        </span>
         <button
           className="btn btn-sm btn-primary"
           disabled={!selected}
-          onClick={() =>
-            run(() =>
-              provisionGenerator(
-                selected,
-                genType,
-                genType === 'usage' ? { intervalMs, eventsPerTick: perTick } : {},
-              ),
-            )
-          }
+          onClick={() => run(() => provisionGenerator(selected, { intervalMs, eventsPerTick: perTick }))}
         >
           Provision generator
         </button>
@@ -637,8 +651,7 @@ export function App() {
             <tr>
               <th>Process</th>
               <th>Customer</th>
-              <th>Type</th>
-              <th>Detail</th>
+              <th>Rate</th>
               <th>Status</th>
               <th>Emitted</th>
               <th>Actions</th>
@@ -647,8 +660,8 @@ export function App() {
           <tbody>
             {procs.length === 0 && (
               <tr>
-                <td colSpan={7} className="text-secondary">
-                  No processes yet.
+                <td colSpan={6} className="text-secondary">
+                  No generators yet.
                 </td>
               </tr>
             )}
@@ -658,48 +671,122 @@ export function App() {
                   <code>{p.id.slice(0, 8)}</code>
                 </td>
                 <td>{nameFor(p.customer_id)}</td>
-                <td>
-                  <span className="badge text-bg-secondary">{p.type}</span>
-                </td>
-                <td>
-                  {p.type === 'subscription'
-                    ? planLabel
-                    : `${p.events_per_tick ?? 1} / ${p.interval_ms} ms`}
-                </td>
+                <td>{`${p.events_per_tick ?? 1} / ${p.interval_ms} ms`}</td>
                 <td>
                   {p.running ? (
                     <span className="text-success">● running</span>
-                  ) : p.cancelled ? (
-                    <span className="text-danger">⊘ cancelled</span>
                   ) : (
                     <span className="text-secondary">■ stopped</span>
                   )}
                 </td>
-                <td>{p.type === 'usage' ? p.emitted : '—'}</td>
+                <td>{p.emitted}</td>
                 <td>
                   <div className="btn-group btn-group-sm">
                     {p.running ? (
                       <button className="btn btn-outline-secondary" onClick={() => run(() => stopGenerator(p.id))}>
-                        {p.type === 'subscription' ? 'Cancel' : 'Stop'}
+                        Stop
                       </button>
-                    ) : p.cancelled ? null : (
+                    ) : (
                       <button className="btn btn-outline-success" onClick={() => run(() => startGenerator(p.id))}>
                         Start
                       </button>
                     )}
-                    {p.type === 'usage' && (
-                      <button
-                        className="btn btn-outline-primary"
-                        title="Emit one usage event now"
-                        onClick={() => run(() => emitLate(p.id))}
-                      >
-                        Emit late
-                      </button>
-                    )}
+                    <button
+                      className="btn btn-outline-primary"
+                      title="Emit one usage event now"
+                      onClick={() => run(() => emitLate(p.id))}
+                    >
+                      Emit late
+                    </button>
                     <button className="btn btn-outline-danger" onClick={() => run(() => deleteGenerator(p.id))}>
                       Delete
                     </button>
                   </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Subscriptions (flat-fee) — owned by invoicing + fakestripe */}
+      <h2 className="h5 mt-4">Subscriptions</h2>
+      <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
+        <select
+          className="form-select form-select-sm w-auto"
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+        >
+          {customers.length === 0 && <option value="">(create a customer first)</option>}
+          {customers.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name} ({c.id})
+            </option>
+          ))}
+        </select>
+        <span className="text-secondary small">fixed plan price: {planLabel}</span>
+        <button
+          className="btn btn-sm btn-primary"
+          disabled={!selected}
+          onClick={() => runSub(() => createSubscription(selected))}
+        >
+          Add subscription
+        </button>
+        <span className="text-secondary small">showing subscriptions for the selected customer</span>
+      </div>
+
+      <div className="table-responsive">
+        <table className="table table-sm align-middle">
+          <thead>
+            <tr>
+              <th>Subscription</th>
+              <th>Customer</th>
+              <th>Stripe sub</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {subs.length === 0 && (
+              <tr>
+                <td colSpan={5} className="text-secondary">
+                  No subscriptions for this customer.
+                </td>
+              </tr>
+            )}
+            {subs.map((s) => (
+              <tr key={s.id}>
+                <td>
+                  <code>{s.id}</code>
+                </td>
+                <td>{nameFor(s.customer_id)}</td>
+                <td>
+                  <code className="small">{s.stripe_subscription_id || '—'}</code>
+                </td>
+                <td>
+                  <span
+                    className={`badge ${
+                      s.status === 'active'
+                        ? 'text-bg-success'
+                        : s.status === 'canceled'
+                          ? 'text-bg-secondary'
+                          : 'text-bg-warning'
+                    }`}
+                  >
+                    {s.status}
+                  </span>
+                </td>
+                <td>
+                  {s.status === 'canceled' ? (
+                    <span className="text-secondary small">—</span>
+                  ) : (
+                    <button
+                      className="btn btn-sm btn-outline-danger"
+                      onClick={() => runSub(() => cancelSubscription(s.id))}
+                    >
+                      Cancel
+                    </button>
+                  )}
                 </td>
               </tr>
             ))}

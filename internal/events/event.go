@@ -20,9 +20,11 @@ type Type string
 const (
 	// UsageIngested: raw usage received from a product/app (generator -> bus).
 	UsageIngested Type = "usage.ingested"
-	// SubscriptionActivated / SubscriptionCancelled: a flat-fee subscription was
-	// started/stopped (generator -> bus); metronome registers/cancels it.
-	SubscriptionActivated Type = "subscription.activated"
+	// SubscriptionCreated / SubscriptionCancelled: a flat-fee subscription's
+	// Stripe lifecycle. Published by invoicing after the provider (fakestripe)
+	// webhook confirms the create/cancel — the events are the observable "fact",
+	// while the command itself travels over HTTP (controlplane -> invoicing).
+	SubscriptionCreated   Type = "subscription.created"
 	SubscriptionCancelled Type = "subscription.cancelled"
 	// BillingCycleEnded: a customer's billing cycle has closed (billing -> bus).
 	// Stripe reacts by pulling the period's usage+price from Metronome and
@@ -57,7 +59,7 @@ func NewID() string {
 func AllTypes() []Type {
 	return []Type{
 		UsageIngested,
-		SubscriptionActivated,
+		SubscriptionCreated,
 		SubscriptionCancelled,
 		BillingCycleEnded,
 		InvoiceFinalized,

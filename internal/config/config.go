@@ -28,6 +28,15 @@ type Config struct {
 	// BillingURL is the base URL of the billing service, which the generator
 	// uses to validate a process's customer against the registry.
 	BillingURL string
+	// InvoicingURL is the base URL of the invoicing service, which the control
+	// plane calls to create/cancel flat-fee subscriptions.
+	InvoicingURL string
+
+	// StripeWebhookURL is where fakestripe delivers subscription lifecycle
+	// webhooks (the invoicing service). StripeWebhookSecret is a shared secret
+	// sent/verified on those webhooks; empty disables verification.
+	StripeWebhookURL    string
+	StripeWebhookSecret string
 
 	// Placeholder credentials for the external providers. Empty for now.
 	StripeAPIKey    string
@@ -39,15 +48,18 @@ type Config struct {
 // and defaultAddr is used when that variable is unset.
 func Load(prefix, defaultAddr string) Config {
 	return Config{
-		HTTPAddr:           env(prefix+"_HTTP_ADDR", defaultAddr),
-		BusKind:            env("BUS", "memory"),
-		KafkaSeeds:         splitSeeds(env("KAFKA_SEEDS", "localhost:9092")),
-		MetronomeBaseURL:   env("METRONOME_BASE_URL", "http://localhost:8083"),
-		StripeBaseURL:      env("STRIPE_BASE_URL", "http://localhost:8084"),
-		MeteringServiceURL: env("METERING_SERVICE_URL", "http://localhost:8082"),
-		BillingURL:         env("BILLING_URL", "http://localhost:8080"),
-		StripeAPIKey:       os.Getenv("STRIPE_API_KEY"),
-		MetronomeAPIKey:    os.Getenv("METRONOME_API_KEY"),
+		HTTPAddr:            env(prefix+"_HTTP_ADDR", defaultAddr),
+		BusKind:             env("BUS", "memory"),
+		KafkaSeeds:          splitSeeds(env("KAFKA_SEEDS", "localhost:9092")),
+		MetronomeBaseURL:    env("METRONOME_BASE_URL", "http://localhost:8083"),
+		StripeBaseURL:       env("STRIPE_BASE_URL", "http://localhost:8084"),
+		MeteringServiceURL:  env("METERING_SERVICE_URL", "http://localhost:8082"),
+		BillingURL:          env("BILLING_URL", "http://localhost:8080"),
+		InvoicingURL:        env("INVOICING_URL", "http://localhost:8081"),
+		StripeWebhookURL:    env("STRIPE_WEBHOOK_URL", "http://localhost:8081"),
+		StripeWebhookSecret: os.Getenv("STRIPE_WEBHOOK_SECRET"),
+		StripeAPIKey:        os.Getenv("STRIPE_API_KEY"),
+		MetronomeAPIKey:     os.Getenv("METRONOME_API_KEY"),
 	}
 }
 

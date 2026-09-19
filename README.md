@@ -19,11 +19,11 @@ billing` for customer validation).
 | Service     | Binary            | Default addr | Responsibility |
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping), the billing-cycle boundary (`billing_cycle.ended`), and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
-| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and flat-fee subscriptions** (`subscription.activated`/`cancelled`). On `billing_cycle.ended`, queries Metronome for usage, creates the invoice (usage items + active subscription fees), maps the payment outcome onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
+| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP and confirms them via the Stripe **webhook** (`POST /webhooks/stripe`), publishing `subscription.created`/`cancelled` on the bus. On `billing_cycle.ended`, queries Metronome for usage and creates the invoice (usage items + subscription fees). Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
 | `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs) mirror real endpoints. `close-period` is a **demo shim** (real Metronome has no such call). Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
-| `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for *generator processes* (`/v1/generators`). Two types: **usage** (ticks → publishes `usage.ingested`) and **subscription** (flat fee; start/stop → `subscription.activated`/`cancelled`). Frontend calls it directly. |
+| `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for **usage generator** processes (`/v1/generators`): they tick and publish `usage.ingested`. Also relays flat-fee **subscription** create/cancel (`/v1/subscriptions`) to the invoicing service (which owns them). Frontend calls it directly. |
 | `eventfeed` | `cmd/eventfeed`   | `:8086`  | **Read-only** live view of the bus. Tails every event topic into a bounded in-memory ring (last ~500) and serves it at `GET /v1/events` for the frontend's **Live events** panel. Consumes only — no produce path — so it is safe to expose publicly (this is the recruiter-facing way to watch events, in place of the Console). |
 
 Override a listen address with `<SERVICE>_HTTP_ADDR` (e.g. `BILLING_HTTP_ADDR`).
@@ -44,7 +44,8 @@ usage       controlplane usage process ─usage.ingested─▶ [bus] ─▶ mete
 (bus)                                                              │  late = occurred_at < period_start
                                                                    └─(batch)─▶ Metronome  (meter; invoicing off)
 
-subs        controlplane subscription process ─subscription.activated/cancelled─▶ [bus] ─▶ invoicing ─▶ Stripe
+subs        frontend ─HTTP─▶ controlplane ─HTTP─▶ invoicing ─create/cancel─▶ Stripe
+(cmd+event)          Stripe ─webhook─▶ invoicing ─subscription.created/cancelled─▶ [bus]   (the "fact")
 
 mid-cycle   frontend ─HTTP─▶ invoicing (/v1/customers/{id}/upcoming-invoice)
 (read)                        ├─ list-costs ◀── metering ◀── Metronome   (priced usage, grouped)
@@ -92,7 +93,7 @@ internal/
   metering/    Metronome metering integration
   fakemetronome/ local stand-in for the Metronome API
   fakestripe/   local stand-in for the Stripe API
-  controlplane/ control plane for usage/subscription generator processes
+  controlplane/ control plane for usage generators; relays subscription commands
 web/            React + Vite + TypeScript frontend (usage dashboard)
 infra/terraform/ provisions the demo EC2 instance (t4g.small)
 ```
@@ -186,18 +187,22 @@ real; only the provider APIs themselves are stubbed. The usage rate is a hardcod
 **$0.0001 per API request** (see *Pricing & rounding* below). Zero-amount cycles
 are skipped (no invoice).
 
-**Hybrid billing:** provision a **subscription** generator too and start it — then
-close the cycle. The invoice carries both a usage line (`Usage-based Billing · gen … (period N)`)
-and a subscription line, because **Stripe** manages the flat-fee subscription and
-adds it when it creates the invoice, alongside the metered-usage items the
-`invoicing` service pulled from Metronome. The subscription price is a **fixed plan
-price owned by Stripe** — the frontend can display it but not set it:
+**Hybrid billing:** add a flat-fee **subscription** too, then close the cycle. The
+invoice carries both a usage line (`Usage-based Billing · gen … (period N)`) and a
+`Flat-fee Subscription` line, because **Stripe** owns the subscription and adds its
+fee when it creates the invoice, alongside the metered-usage items the `invoicing`
+service pulled from Metronome. The subscription price is a **fixed plan price owned
+by Stripe** — the frontend can display it but not set it. Creating a subscription
+goes control plane → invoicing → Stripe, and Stripe confirms it back via webhook
+(the request is idempotent — the `Idempotency-Key` header dedupes a retry):
 
 ```sh
 curl -s http://localhost/v1/subscription-plan            # {"amount_cents":5000,"currency":"usd"}
-curl -s -X POST http://localhost/v1/generators \
-  -d "{\"customer_id\":\"$CUST\",\"type\":\"subscription\"}" | jq .   # no amount
-# then start it, and close the cycle as in step 4
+curl -s -X POST http://localhost/v1/subscriptions \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"customer_id\":\"$CUST\"}" | jq .    # -> {id: isub_…, status: "pending", stripe_subscription_id: sub_…}
+curl -s http://localhost/v1/customers/$CUST/subscriptions | jq .   # status flips to "active" after the webhook
+# then close the cycle as in step 4
 ```
 
 **5. Late-arriving usage:** the `emit` endpoint **backdates** usage timestamps to
@@ -262,10 +267,9 @@ elapsed period time — real Stripe prorates by the actual time fraction, and on
 when a subscription changes mid-period.
 
 **Subscription cancellation.** Cancelling a flat-fee subscription mid-cycle
-(stopping the subscription generator) is **terminal** — it can never be resumed;
-a new subscription must be provisioned in its place (`controlplane` rejects a
-restart with `409`, and `fakestripe` rejects re-registering the same id). The
-cancelled subscription is **not** dropped immediately: it stays until the next
+(`POST /v1/subscriptions/{id}/cancel`) is **terminal** — it can never be resumed;
+a new subscription must be created in its place (a new entity, with its own ids).
+The cancelled subscription is **not** dropped immediately: it stays until the next
 invoice, which bills it at the **prorated** amount for the partial period it was
 active and lists it as `Flat-fee Subscription (cancelled, prorated)`, then removes
 it (so it never bills again). An **active** subscription, by contrast, bills the

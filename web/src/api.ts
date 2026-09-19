@@ -8,22 +8,28 @@ export interface Customer {
   created_at: string
 }
 
-export type GeneratorType = 'usage' | 'subscription'
-
 export interface GeneratorProcess {
   id: string
-  type: GeneratorType
+  type: 'usage'
   customer_id: string
   interval_ms?: number
   events_per_tick?: number
   running: boolean
   emitted: number
-  cancelled?: boolean // subscription: cancellation is terminal (no resume)
 }
 
 export interface SubscriptionPlan {
   amount_cents: number
   currency: string
+}
+
+// Subscription is the invoicing-side flat-fee subscription entity.
+export interface Subscription {
+  id: string
+  customer_id: string
+  stripe_subscription_id: string
+  status: string // pending | active | canceled
+  created_at: string
 }
 
 export interface InvoiceLine {
@@ -93,22 +99,45 @@ export async function getSubscriptionPlan(): Promise<SubscriptionPlan> {
 
 export async function provisionGenerator(
   customerId: string,
-  type: GeneratorType,
   opts: { intervalMs?: number; eventsPerTick?: number } = {},
 ): Promise<GeneratorProcess> {
-  // A subscription's price is fixed by Stripe; the frontend never sends an amount.
   return asJSON<GeneratorProcess>(
     await fetch(BASE, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         customer_id: customerId,
-        type,
+        type: 'usage',
         interval_ms: opts.intervalMs,
         events_per_tick: opts.eventsPerTick,
       }),
     }),
   )
+}
+
+// --- flat-fee subscriptions (owned by invoicing; created/cancelled via the
+// control plane). The price is Stripe's fixed plan price — no amount is sent. ---
+
+export async function listSubscriptions(customerId: string): Promise<Subscription[]> {
+  return asJSON<Subscription[]>(await fetch(`/v1/customers/${customerId}/subscriptions`))
+}
+
+export async function createSubscription(customerId: string): Promise<Subscription> {
+  // An Idempotency-Key makes a retried create safe (no duplicate subscription).
+  return asJSON<Subscription>(
+    await fetch('/v1/subscriptions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+      body: JSON.stringify({ customer_id: customerId }),
+    }),
+  )
+}
+
+export async function cancelSubscription(id: string): Promise<void> {
+  const res = await fetch(`/v1/subscriptions/${id}/cancel`, { method: 'POST' })
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText}`)
+  }
 }
 
 export async function startGenerator(id: string): Promise<GeneratorProcess> {

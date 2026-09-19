@@ -1,20 +1,20 @@
-// Package controlplane is the control plane for two kinds of provisionable
-// processes:
+// Package controlplane is the control plane for usage-generator processes: each
+// ticks on an interval and publishes usage.ingested events (Metronome meters and
+// prices them per unit). The frontend provisions and starts/stops these here.
 //
-//   - "usage"        — ticks on an interval and publishes usage.ingested events
-//     (metronome meters + prices them per unit).
-//   - "subscription" — a flat recurring fee; it doesn't tick. Start activates it
-//     (subscription.activated), stop cancels it
-//     (subscription.cancelled); while active its fee is billed
-//     each cycle.
+// Flat-fee subscriptions are NOT processes here — they are separate entities owned
+// by the invoicing service (link record) and fakestripe (the Stripe subscription).
+// The control plane only relays subscription create/cancel to invoicing.
 //
-// The frontend provisions and starts/stops processes here. This is a demo
-// simulator, so there is no per-user access control and state is in-memory.
+// This is a demo simulator, so there is no per-user access control and state is
+// in-memory.
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -26,24 +26,24 @@ import (
 	"github.com/akydd/stripe_metronome/internal/events"
 )
 
-// Process types.
-const (
-	TypeUsage        = "usage"
-	TypeSubscription = "subscription"
-)
+// TypeUsage is the only generator process type. Flat-fee subscriptions are no
+// longer control-plane processes — they're separate entities owned by invoicing
+// (link record) + fakestripe (the Stripe subscription); the control plane only
+// relays create/cancel to invoicing.
+const TypeUsage = "usage"
 
-// Manager owns the set of provisioned processes.
+// Manager owns the set of provisioned usage-generator processes.
 type Manager struct {
-	bus        events.Bus
-	log        *slog.Logger
-	http       *http.Client
-	billingURL string // for validating a process's customer against the registry
-	mu         sync.Mutex
-	procs      map[string]*process
+	bus          events.Bus
+	log          *slog.Logger
+	http         *http.Client
+	billingURL   string // validates a process's customer against the registry
+	invoicingURL string // relays flat-fee subscription create/cancel
+	mu           sync.Mutex
+	procs        map[string]*process
 }
 
-// process is a provisioned generator. Fields are guarded by Manager.mu.
-// A subscription's price is not stored here — it's Stripe's fixed plan price.
+// process is a provisioned usage generator. Fields are guarded by Manager.mu.
 type process struct {
 	ID            string `json:"id"`
 	Type          string `json:"type"`
@@ -51,21 +51,21 @@ type process struct {
 	IntervalMS    int    `json:"interval_ms,omitempty"`     // usage only
 	EventsPerTick int    `json:"events_per_tick,omitempty"` // usage only
 	Running       bool   `json:"running"`
-	Emitted       int    `json:"emitted"`   // usage: events emitted
-	Cancelled     bool   `json:"cancelled"` // subscription: cancellation is terminal
+	Emitted       int    `json:"emitted"` // usage: events emitted
 
 	cancel context.CancelFunc
 }
 
-// New constructs a Manager. billingURL is the base URL of the customer registry
-// used to validate a process's customer at provision time.
-func New(bus events.Bus, log *slog.Logger, billingURL string) *Manager {
+// New constructs a Manager. billingURL validates a process's customer; invoicingURL
+// is where flat-fee subscription create/cancel requests are relayed.
+func New(bus events.Bus, log *slog.Logger, billingURL, invoicingURL string) *Manager {
 	return &Manager{
-		bus:        bus,
-		log:        log,
-		http:       &http.Client{Timeout: 10 * time.Second},
-		billingURL: billingURL,
-		procs:      map[string]*process{},
+		bus:          bus,
+		log:          log,
+		http:         &http.Client{Timeout: 10 * time.Second},
+		billingURL:   billingURL,
+		invoicingURL: invoicingURL,
+		procs:        map[string]*process{},
 	}
 }
 
@@ -79,6 +79,11 @@ func (m *Manager) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/generators/{id}/stop", m.handleStop)
 	mux.HandleFunc("POST /v1/generators/{id}/emit", m.handleEmit)
 	mux.HandleFunc("DELETE /v1/generators/{id}", m.handleDelete)
+
+	// Flat-fee subscriptions: relay create/cancel to the invoicing service, which
+	// owns the subscription entity.
+	mux.HandleFunc("POST /v1/subscriptions", m.handleCreateSubscription)
+	mux.HandleFunc("POST /v1/subscriptions/{id}/cancel", m.handleCancelSubscription)
 }
 
 // Close stops all running usage processes (used on shutdown).
@@ -103,8 +108,8 @@ func (m *Manager) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if req.Type == "" {
 		req.Type = TypeUsage
 	}
-	if req.Type != TypeUsage && req.Type != TypeSubscription {
-		http.Error(w, "type must be 'usage' or 'subscription'", http.StatusBadRequest)
+	if req.Type != TypeUsage {
+		http.Error(w, "only 'usage' generators are provisioned here; create a flat-fee subscription via POST /v1/subscriptions", http.StatusBadRequest)
 		return
 	}
 	if req.CustomerID == "" {
@@ -116,21 +121,18 @@ func (m *Manager) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p := &process{ID: events.NewID(), Type: req.Type, CustomerID: req.CustomerID}
-	if req.Type == TypeUsage {
-		p.IntervalMS = req.IntervalMS
-		if p.IntervalMS <= 0 {
-			p.IntervalMS = 5000
-		}
-		p.EventsPerTick = req.EventsPerTick
-		if p.EventsPerTick <= 0 {
-			p.EventsPerTick = 1
-		}
-		if p.EventsPerTick > 5000 {
-			p.EventsPerTick = 5000
-		}
+	p := &process{ID: events.NewID(), Type: TypeUsage, CustomerID: req.CustomerID}
+	p.IntervalMS = req.IntervalMS
+	if p.IntervalMS <= 0 {
+		p.IntervalMS = 5000
 	}
-	// A subscription carries no amount — Stripe owns the fixed plan price.
+	p.EventsPerTick = req.EventsPerTick
+	if p.EventsPerTick <= 0 {
+		p.EventsPerTick = 1
+	}
+	if p.EventsPerTick > 5000 {
+		p.EventsPerTick = 5000
+	}
 
 	m.mu.Lock()
 	m.procs[p.ID] = p
@@ -150,30 +152,16 @@ func (m *Manager) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "process not found", http.StatusNotFound)
 		return
 	}
-	// A cancelled flat-fee subscription can never be resumed — provision a new one.
-	if p.Type == TypeSubscription && p.Cancelled {
-		m.mu.Unlock()
-		http.Error(w, "subscription was cancelled and cannot be resumed; provision a new subscription", http.StatusConflict)
-		return
-	}
-	started := false
 	if !p.Running {
 		p.Running = true
-		started = true
-		if p.Type == TypeUsage {
-			ctx, cancel := context.WithCancel(context.Background())
-			p.cancel = cancel
-			go m.run(ctx, id, p.CustomerID, time.Duration(p.IntervalMS)*time.Millisecond, p.EventsPerTick)
-		}
+		ctx, cancel := context.WithCancel(context.Background())
+		p.cancel = cancel
+		go m.run(ctx, id, p.CustomerID, time.Duration(p.IntervalMS)*time.Millisecond, p.EventsPerTick)
 	}
-	typ, cust := p.Type, p.CustomerID
 	out := *p
 	m.mu.Unlock()
 
-	if started && typ == TypeSubscription {
-		m.publishSubscription(r.Context(), events.SubscriptionActivated, id, cust)
-	}
-	m.log.Info("started process", "id", id, "type", typ)
+	m.log.Info("started process", "id", id)
 	writeJSON(w, http.StatusOK, &out)
 }
 
@@ -186,27 +174,17 @@ func (m *Manager) handleStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "process not found", http.StatusNotFound)
 		return
 	}
-	stopped := false
 	if p.Running {
 		p.Running = false
-		stopped = true
 		if p.cancel != nil {
 			p.cancel()
 			p.cancel = nil
 		}
-		// Stopping a subscription cancels it, and cancellation is terminal.
-		if p.Type == TypeSubscription {
-			p.Cancelled = true
-		}
 	}
-	typ, cust := p.Type, p.CustomerID
 	out := *p
 	m.mu.Unlock()
 
-	if stopped && typ == TypeSubscription {
-		m.publishSubscription(r.Context(), events.SubscriptionCancelled, id, cust)
-	}
-	m.log.Info("stopped process", "id", id, "type", typ)
+	m.log.Info("stopped process", "id", id)
 	writeJSON(w, http.StatusOK, &out)
 }
 
@@ -219,17 +197,12 @@ func (m *Manager) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "process not found", http.StatusNotFound)
 		return
 	}
-	wasRunningSub := p.Running && p.Type == TypeSubscription
-	cust := p.CustomerID
 	if p.cancel != nil {
 		p.cancel()
 	}
 	delete(m.procs, id)
 	m.mu.Unlock()
 
-	if wasRunningSub {
-		m.publishSubscription(r.Context(), events.SubscriptionCancelled, id, cust)
-	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -260,17 +233,58 @@ func (m *Manager) handleList(w http.ResponseWriter, _ *http.Request) {
 
 // publishSubscription emits a subscription lifecycle event to the bus. No amount
 // is carried — Stripe owns the fixed plan price.
-func (m *Manager) publishSubscription(ctx context.Context, t events.Type, id, customer string) {
-	payload, _ := json.Marshal(map[string]any{"subscription_id": id})
-	if err := m.bus.Publish(ctx, events.Event{
-		ID:         events.NewID(),
-		Type:       t,
-		CustomerID: customer,
-		OccurredAt: time.Now().UTC(),
-		Payload:    payload,
-	}); err != nil {
-		m.log.Error("publish subscription event failed", "type", t, "err", err)
+// handleCreateSubscription relays a flat-fee subscription create to the invoicing
+// service (which owns the entity). It validates the customer first and forwards
+// the client's Idempotency-Key end-to-end so a retry can't double-create.
+func (m *Manager) handleCreateSubscription(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CustomerID string `json:"customer_id"`
 	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.CustomerID == "" {
+		http.Error(w, "customer_id required", http.StatusBadRequest)
+		return
+	}
+	if !m.customerExists(r.Context(), req.CustomerID) {
+		http.Error(w, "unknown customer", http.StatusBadRequest)
+		return
+	}
+	body, _ := json.Marshal(map[string]any{"customer_id": req.CustomerID})
+	m.relay(w, r, http.MethodPost, m.invoicingURL+"/v1/subscriptions", body)
+}
+
+// handleCancelSubscription relays a cancel to the invoicing service.
+func (m *Manager) handleCancelSubscription(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	m.relay(w, r, http.MethodPost, m.invoicingURL+"/v1/subscriptions/"+id+"/cancel", nil)
+}
+
+// relay proxies a subscription command to invoicing, forwarding the Idempotency-Key
+// header and streaming the response back to the caller.
+func (m *Manager) relay(w http.ResponseWriter, r *http.Request, method, url string, body []byte) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, url, rdr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if k := r.Header.Get("Idempotency-Key"); k != "" {
+		req.Header.Set("Idempotency-Key", k)
+	}
+	resp, err := m.http.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(respBody)
 }
 
 // customerExists checks the billing customer registry. Fails closed: if the

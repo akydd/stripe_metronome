@@ -1,4 +1,5 @@
-// Command controlplane runs the control plane for usage/subscription processes.
+// Command controlplane runs the control plane for usage-generator processes (and
+// relays flat-fee subscription commands to the invoicing service).
 package main
 
 import (
@@ -29,7 +30,7 @@ func main() {
 	}
 	defer bus.Close()
 
-	mgr := controlplane.New(bus, log, cfg.BillingURL)
+	mgr := controlplane.New(bus, log, cfg.BillingURL, cfg.InvoicingURL)
 	defer mgr.Close()
 
 	mux := http.NewServeMux()

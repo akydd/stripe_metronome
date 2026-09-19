@@ -23,7 +23,7 @@ func main() {
 	cfg := config.Load("FAKESTRIPE", ":8084")
 
 	mux := http.NewServeMux()
-	fakestripe.New(log).Register(mux)
+	fakestripe.New(log, cfg.StripeWebhookURL, cfg.StripeWebhookSecret).Register(mux)
 
 	if err := app.Serve(ctx, "fakestripe", cfg.HTTPAddr, log, mux); err != nil {
 		log.Error("service exited with error", "err", err)
