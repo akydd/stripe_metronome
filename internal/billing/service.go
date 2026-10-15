@@ -56,9 +56,6 @@ func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/customers", s.listCustomers)
 	mux.HandleFunc("GET /v1/customers/{id}", s.getCustomer)
 
-	// Close a customer's billing cycle — Stripe reacts and invoices.
-	mux.HandleFunc("POST /v1/billing-cycles/{customer}/close", s.handleCloseCycle)
-
 	// Track payment outcomes.
 	s.bus.Subscribe(events.PaymentSucceeded, s.onPaymentSucceeded)
 	s.bus.Subscribe(events.PaymentFailed, s.onPaymentFailed)
@@ -115,33 +112,6 @@ func (s *Service) listCustomers(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
 	writeJSON(w, http.StatusOK, out)
-}
-
-// --- billing cycle ---
-
-// handleCloseCycle ends a customer's billing cycle by publishing billing_cycle.ended.
-func (s *Service) handleCloseCycle(w http.ResponseWriter, r *http.Request) {
-	customer := r.PathValue("customer")
-	if customer == "" {
-		http.Error(w, "missing customer", http.StatusBadRequest)
-		return
-	}
-	s.log.Info("closing billing cycle", "customer", customer)
-	if err := s.bus.Publish(r.Context(), events.Event{
-		ID:         events.NewID(),
-		Type:       events.BillingCycleEnded,
-		CustomerID: customer,
-		OccurredAt: time.Now().UTC(),
-	}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status":      "cycle_closing",
-		"customer_id": customer,
-	})
 }
 
 // --- payment outcomes ---

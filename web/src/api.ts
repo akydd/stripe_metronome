@@ -23,14 +23,19 @@ export interface SubscriptionPlan {
   currency: string
 }
 
-// Subscription is the invoicing-side flat-fee subscription entity.
+// Subscription is a customer's subscription container (holds flat_fee/usage items).
 export interface Subscription {
   id: string
   customer_id: string
   stripe_subscription_id: string
   status: string // pending | active | canceled
+  items: string[] // "flat_fee", "usage"
+  current_period_end: string // when the next invoice auto-finalizes
+  period: number
   created_at: string
 }
+
+export type ItemType = 'flat_fee' | 'usage'
 
 export interface InvoiceLine {
   description: string
@@ -122,19 +127,27 @@ export async function listSubscriptions(customerId: string): Promise<Subscriptio
   return asJSON<Subscription[]>(await fetch(`/v1/customers/${customerId}/subscriptions`))
 }
 
-export async function createSubscription(customerId: string): Promise<Subscription> {
-  // An Idempotency-Key makes a retried create safe (no duplicate subscription).
+// addSubscriptionItem adds a flat_fee or usage item to the customer's container
+// (creating it if needed). An Idempotency-Key makes a retried add safe.
+export async function addSubscriptionItem(
+  customerId: string,
+  itemType: ItemType,
+): Promise<Subscription> {
   return asJSON<Subscription>(
     await fetch('/v1/subscriptions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
-      body: JSON.stringify({ customer_id: customerId }),
+      body: JSON.stringify({ customer_id: customerId, item_type: itemType }),
     }),
   )
 }
 
-export async function cancelSubscription(id: string): Promise<void> {
-  const res = await fetch(`/v1/subscriptions/${id}/cancel`, { method: 'POST' })
+export async function removeSubscriptionItem(customerId: string, itemType: ItemType): Promise<void> {
+  const res = await fetch('/v1/subscriptions/remove-item', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ customer_id: customerId, item_type: itemType }),
+  })
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`)
   }
@@ -155,18 +168,10 @@ export async function deleteGenerator(id: string): Promise<void> {
   }
 }
 
-// emitLate fires usage events on demand (independent of the tick loop) — e.g. to
-// generate late-arriving usage after a billing cycle has been closed.
-export async function emitLate(id: string, count = 1): Promise<void> {
+// emitUsage fires a burst of usage events on demand (independent of the tick loop),
+// timestamped now.
+export async function emitUsage(id: string, count = 1): Promise<void> {
   const res = await fetch(`${BASE}/${id}/emit?count=${count}`, { method: 'POST' })
-  if (!res.ok) {
-    throw new Error(`${res.status} ${res.statusText}`)
-  }
-}
-
-// closeCycle ends a customer's billing cycle (triggers Stripe invoicing).
-export async function closeCycle(customerId: string): Promise<void> {
-  const res = await fetch(`/v1/billing-cycles/${customerId}/close`, { method: 'POST' })
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`)
   }

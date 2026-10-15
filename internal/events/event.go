@@ -26,10 +26,6 @@ const (
 	// while the command itself travels over HTTP (controlplane -> invoicing).
 	SubscriptionCreated   Type = "subscription.created"
 	SubscriptionCancelled Type = "subscription.cancelled"
-	// BillingCycleEnded: a customer's billing cycle has closed (billing -> bus).
-	// Stripe reacts by pulling the period's usage+price from Metronome and
-	// invoicing it.
-	BillingCycleEnded Type = "billing_cycle.ended"
 	// InvoiceFinalized: Stripe created + finalized the invoice (stripe -> bus).
 	InvoiceFinalized Type = "invoice.finalized"
 	// PaymentSucceeded / PaymentFailed: payment outcome (stripe -> bus).
@@ -61,7 +57,6 @@ func AllTypes() []Type {
 		UsageIngested,
 		SubscriptionCreated,
 		SubscriptionCancelled,
-		BillingCycleEnded,
 		InvoiceFinalized,
 		PaymentSucceeded,
 		PaymentFailed,

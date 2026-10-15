@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"sync"
 	"time"
@@ -33,21 +34,26 @@ type Service struct {
 	meteringURL   string // metering service, for the usage+price query
 	webhookSecret string // shared secret expected on inbound Stripe webhooks
 
-	// Flat-fee subscription link records: the invoicing-side entity tying a
-	// customer to a Stripe subscription. Owned here; created via HTTP command and
-	// confirmed via the fakestripe webhook.
-	subMu   sync.Mutex
-	subs    map[string]*Subscription // invoicing id -> record
-	subIdem map[string]string        // Idempotency-Key -> invoicing id
+	// Subscription link records: the invoicing-side entity tying a customer to a
+	// Stripe subscription container. One per customer (combined billing). Owned
+	// here; synced from fakestripe webhooks.
+	subMu         sync.Mutex
+	subs          map[string]*Subscription // invoicing id -> record
+	subByCustomer map[string]string        // customer -> invoicing id
+	subIdem       map[string]string        // Idempotency-Key -> invoicing id
 }
 
-// Subscription is the invoicing-side link record for a flat-fee subscription.
+// Subscription is the invoicing-side link record for a customer's subscription
+// container (which holds flat_fee and/or usage items).
 type Subscription struct {
-	ID                   string `json:"id"`                     // invoicing's own id (isub_…)
-	CustomerID           string `json:"customer_id"`            // billing customer id
-	StripeSubscriptionID string `json:"stripe_subscription_id"` // fakestripe id (sub_…)
-	Status               string `json:"status"`                 // pending -> active -> canceled
-	CreatedAt            string `json:"created_at"`
+	ID                   string   `json:"id"`                     // invoicing's own id (isub_…)
+	CustomerID           string   `json:"customer_id"`            // billing customer id
+	StripeSubscriptionID string   `json:"stripe_subscription_id"` // fakestripe id (sub_…)
+	Status               string   `json:"status"`                 // pending -> active -> canceled
+	Items                []string `json:"items"`                  // flat_fee, usage
+	CurrentPeriodEnd     string   `json:"current_period_end"`     // when the next invoice finalizes
+	Period               int      `json:"period"`                 // current period number
+	CreatedAt            string   `json:"created_at"`
 }
 
 // New constructs the Stripe service.
@@ -61,23 +67,21 @@ func New(cfg config.Config, bus events.Bus, log *slog.Logger) *Service {
 		meteringURL:   cfg.MeteringServiceURL,
 		webhookSecret: cfg.StripeWebhookSecret,
 		subs:          map[string]*Subscription{},
+		subByCustomer: map[string]string{},
 		subIdem:       map[string]string{},
 	}
 }
 
 // Register wires the service's event subscriptions and HTTP routes.
 func (s *Service) Register(mux *http.ServeMux) {
-	// At cycle end, pull usage from Metronome and invoice it.
-	s.bus.Subscribe(events.BillingCycleEnded, s.onBillingCycleEnded)
-
 	// Surface the fixed subscription plan price to the frontend (read-only).
 	mux.HandleFunc("GET /v1/subscription-plan", s.handleSubscriptionPlan)
 
-	// Flat-fee subscription lifecycle (created/cancelled over HTTP; the control
-	// plane delegates here). The Stripe subscription lives in fakestripe; this
+	// Subscription item lifecycle (add/remove an item over HTTP; the control plane
+	// delegates here). The Stripe subscription container lives in fakestripe; this
 	// service owns the link record tying it to the customer.
-	mux.HandleFunc("POST /v1/subscriptions", s.handleCreateSubscription)
-	mux.HandleFunc("POST /v1/subscriptions/{id}/cancel", s.handleCancelSubscription)
+	mux.HandleFunc("POST /v1/subscriptions", s.handleAddItem)
+	mux.HandleFunc("POST /v1/subscriptions/remove-item", s.handleRemoveItem)
 	mux.HandleFunc("GET /v1/customers/{id}/subscriptions", s.handleListSubscriptions)
 
 	// Invoice views for the frontend: the mid-cycle preview and finalized history.
@@ -104,12 +108,9 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 	}
 	var subs struct {
 		Subscriptions []struct {
-			SubscriptionID string `json:"subscription_id"`
-			ProratedCents  int    `json:"prorated_cents"`
-			Cancelled      bool   `json:"cancelled"`
+			HasFlat           bool `json:"has_flat"`
+			FlatProratedCents int  `json:"flat_prorated_cents"`
 		} `json:"subscriptions"`
-		TotalCents         int `json:"total_cents"`
-		ProratedTotalCents int `json:"prorated_total_cents"`
 	}
 	if err := s.getJSON(r.Context(), s.baseURL+"/v1/customers/"+id+"/subscriptions", &subs); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -120,24 +121,22 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		currency = "usd"
 	}
 
-	// Mid-cycle shows each subscription PRORATED for the partial period; the
-	// finalized invoice bills active subs the full period. A subscription
-	// cancelled mid-cycle stays on the preview at its prorated amount, labelled
-	// cancelled — that's what the close will bill.
-	subscriptionProrated := subs.ProratedTotalCents > 0
+	// Mid-cycle shows the flat fee accrued so far this period ($1/s), plus current
+	// usage. The finalized invoice at the period boundary bills the full flat fee.
+	subscriptionProrated := false
 	lines := []map[string]any{}
+	var subMicros int64
 	for _, sub := range subs.Subscriptions {
-		if sub.ProratedCents <= 0 {
+		if !sub.HasFlat || sub.FlatProratedCents <= 0 {
 			continue
 		}
-		desc := "Flat-fee Subscription (prorated)"
-		if sub.Cancelled {
-			desc = "Flat-fee Subscription (cancelled, prorated)"
-		}
+		m := int64(sub.FlatProratedCents) * microsPerCent
 		lines = append(lines, map[string]any{
-			"description":   desc,
-			"amount_micros": int64(sub.ProratedCents) * microsPerCent,
+			"description":   "Flat-fee Subscription (prorated)",
+			"amount_micros": m,
 		})
+		subMicros += m
+		subscriptionProrated = true
 	}
 	var usageMicros int64
 	for _, g := range usage.Groups {
@@ -154,7 +153,6 @@ func (s *Service) handleUpcomingInvoice(w http.ResponseWriter, r *http.Request) 
 		})
 		usageMicros += g.UsageMicros
 	}
-	subMicros := int64(subs.ProratedTotalCents) * microsPerCent
 	totalMicros := usageMicros + subMicros
 	writeJSON(w, http.StatusOK, map[string]any{
 		"customer_id":           id,
@@ -215,18 +213,21 @@ func (s *Service) handleListInvoices(w http.ResponseWriter, r *http.Request) {
 	s.proxyGET(w, r, s.baseURL+"/v1/customers/"+r.PathValue("id")+"/invoices")
 }
 
-// handleCreateSubscription creates a flat-fee subscription: it records a pending
-// link entity, then asks Stripe (fakestripe) to create the subscription, tagging
-// it with this record's id so the async webhook can be correlated. The record
-// flips to "active" when that webhook arrives. Honors the Idempotency-Key header
-// end-to-end so a retried create can't produce a duplicate.
-func (s *Service) handleCreateSubscription(w http.ResponseWriter, r *http.Request) {
+// handleAddItem adds an item (flat_fee or usage) to the customer's subscription
+// container, creating the container's link record if the customer doesn't have one.
+// It tags the Stripe request with this record's id so the async webhook correlates
+// back. Honors the Idempotency-Key header end-to-end.
+func (s *Service) handleAddItem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CustomerID string `json:"customer_id"`
+		ItemType   string `json:"item_type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.CustomerID == "" {
 		http.Error(w, "customer_id required", http.StatusBadRequest)
 		return
+	}
+	if req.ItemType == "" {
+		req.ItemType = "flat_fee"
 	}
 	idemKey := r.Header.Get("Idempotency-Key")
 
@@ -241,61 +242,70 @@ func (s *Service) handleCreateSubscription(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
-	sub := &Subscription{
-		ID:         "isub_" + events.NewID()[:12],
-		CustomerID: req.CustomerID,
-		Status:     "pending",
-		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+	var sub *Subscription
+	if id, ok := s.subByCustomer[req.CustomerID]; ok && s.subs[id] != nil {
+		sub = s.subs[id] // reuse the customer's existing container
+	} else {
+		sub = &Subscription{
+			ID: "isub_" + events.NewID()[:12], CustomerID: req.CustomerID,
+			Status: "pending", CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		s.subs[sub.ID] = sub
+		s.subByCustomer[req.CustomerID] = sub.ID
 	}
-	s.subs[sub.ID] = sub
 	if idemKey != "" {
 		s.subIdem[idemKey] = sub.ID
 	}
+	invoicingSubID := sub.ID
 	s.subMu.Unlock()
 
-	stripeID, err := s.createStripeSubscription(r.Context(), req.CustomerID, sub.ID, idemKey)
+	stripeID, err := s.createStripeItem(r.Context(), req.CustomerID, invoicingSubID, req.ItemType, idemKey)
 	if err != nil {
-		s.log.Error("create stripe subscription failed", "customer", req.CustomerID, "err", err)
-		http.Error(w, "failed to create subscription: "+err.Error(), http.StatusBadGateway)
+		s.log.Error("add subscription item failed", "customer", req.CustomerID, "item", req.ItemType, "err", err)
+		http.Error(w, "failed to add item: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	s.subMu.Lock()
-	sub.StripeSubscriptionID = stripeID
+	if sub.StripeSubscriptionID == "" {
+		sub.StripeSubscriptionID = stripeID
+	}
 	out := *sub
 	s.subMu.Unlock()
 
-	s.log.Info("subscription requested", "id", sub.ID, "stripe_id", stripeID, "customer", req.CustomerID)
+	s.log.Info("subscription item requested", "id", invoicingSubID, "stripe_id", stripeID, "customer", req.CustomerID, "item", req.ItemType)
 	writeJSON(w, http.StatusCreated, &out)
 }
 
-// handleCancelSubscription cancels a flat-fee subscription in Stripe. The record
-// flips to "canceled" when the deletion webhook arrives. Cancellation is terminal.
-func (s *Service) handleCancelSubscription(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+// handleRemoveItem removes an item from the customer's container in Stripe. The
+// record syncs (item dropped / container ends) when the webhook arrives.
+func (s *Service) handleRemoveItem(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CustomerID string `json:"customer_id"`
+		ItemType   string `json:"item_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.CustomerID == "" || req.ItemType == "" {
+		http.Error(w, "customer_id and item_type required", http.StatusBadRequest)
+		return
+	}
 	s.subMu.Lock()
-	sub := s.subs[id]
 	var stripeID string
-	if sub != nil {
-		stripeID = sub.StripeSubscriptionID
+	if id, ok := s.subByCustomer[req.CustomerID]; ok {
+		if sub := s.subs[id]; sub != nil {
+			stripeID = sub.StripeSubscriptionID
+		}
 	}
 	s.subMu.Unlock()
-	if sub == nil {
-		http.Error(w, "subscription not found", http.StatusNotFound)
-		return
-	}
 	if stripeID == "" {
-		http.Error(w, "subscription not yet confirmed by Stripe; retry shortly", http.StatusConflict)
+		http.Error(w, "no subscription for customer (or not yet confirmed)", http.StatusConflict)
 		return
 	}
-	if err := s.deleteURL(r.Context(), s.baseURL+"/v1/subscriptions/"+stripeID); err != nil {
-		s.log.Error("cancel stripe subscription failed", "stripe_id", stripeID, "err", err)
-		http.Error(w, "failed to cancel subscription", http.StatusBadGateway)
+	if err := s.deleteURL(r.Context(), s.baseURL+"/v1/subscriptions/"+stripeID+"/items/"+req.ItemType); err != nil {
+		s.log.Error("remove subscription item failed", "stripe_id", stripeID, "item", req.ItemType, "err", err)
+		http.Error(w, "failed to remove item", http.StatusBadGateway)
 		return
 	}
-	s.subMu.Lock()
-	out := *sub // webhook will flip status to "canceled"
-	s.subMu.Unlock()
-	writeJSON(w, http.StatusAccepted, &out)
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "removing", "item_type": req.ItemType})
 }
 
 // handleListSubscriptions returns a customer's link records (the invoicing-side
@@ -319,13 +329,15 @@ func (s *Service) handleSubscriptionPlan(w http.ResponseWriter, r *http.Request)
 	s.proxyGET(w, r, s.baseURL+"/v1/subscription-plan")
 }
 
-// createStripeSubscription creates the Stripe subscription in fakestripe, tagging
-// it with this service's link id so the async webhook can be correlated back, and
-// forwarding the idempotency key. Returns the minted Stripe subscription id.
-func (s *Service) createStripeSubscription(ctx context.Context, customerID, invoicingSubID, idemKey string) (string, error) {
+// createStripeItem adds an item to the customer's Stripe subscription container
+// (creating it if needed), tagging it with this service's link id so the async
+// webhook correlates back, and forwarding the idempotency key. Returns the Stripe
+// container id.
+func (s *Service) createStripeItem(ctx context.Context, customerID, invoicingSubID, itemType, idemKey string) (string, error) {
 	body, err := json.Marshal(map[string]any{
-		"customer": customerID,
-		"metadata": map[string]string{"invoicing_subscription_id": invoicingSubID},
+		"customer":  customerID,
+		"item_type": itemType,
+		"metadata":  map[string]string{"invoicing_subscription_id": invoicingSubID},
 	})
 	if err != nil {
 		return "", err
@@ -345,7 +357,7 @@ func (s *Service) createStripeSubscription(ctx context.Context, customerID, invo
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("stripe create subscription: %s: %s", resp.Status, string(respBody))
+		return "", fmt.Errorf("stripe add item: %s: %s", resp.Status, string(respBody))
 	}
 	var obj struct {
 		ID string `json:"id"`
@@ -356,39 +368,44 @@ func (s *Service) createStripeSubscription(ctx context.Context, customerID, invo
 	return obj.ID, nil
 }
 
-// onBillingCycleEnded queries Metronome for the closed period's usage + price and
-// invoices it through Stripe.
-func (s *Service) onBillingCycleEnded(ctx context.Context, e events.Event) error {
-	// 1. Query Metronome: close the period and get its priced usage. This also
-	//    rolls later usage into the next period (next invoice).
-	var billed struct {
-		Period   int          `json:"period"`
-		Currency string       `json:"currency"`
-		Groups   []usageGroup `json:"groups"`
-	}
-	if err := s.postJSON(ctx, s.meteringURL+"/v1/customers/"+e.CustomerID+"/close-period", nil, &billed); err != nil {
-		return fmt.Errorf("query metronome usage: %w", err)
-	}
-	currency := billed.Currency
-	if currency == "" {
-		currency = "usd"
+// finalizeSubscriptionInvoice bills one subscription's billing period: it pulls
+// that period's usage from Metronome for the exact window (so Metronome's own
+// schedule need not match Stripe's), pushes it to Stripe as invoice items, then
+// finalizes ONE invoice = the subscription fee + those usage items. The provider
+// outcome is mapped onto the bus. `final` marks a cancellation's prorated closer.
+func (s *Service) finalizeSubscriptionInvoice(ctx context.Context, customerID, stripeSubID string, periodStart, periodEnd time.Time, period int, final, billUsage bool) error {
+	// 1. If the container bills usage, pull this period's usage from Metronome for
+	//    the exact [start, end) window; finalize=true advances Metronome's watermark.
+	if billUsage {
+		q := url.Values{}
+		q.Set("start", periodStart.Format(time.RFC3339))
+		q.Set("end", periodEnd.Format(time.RFC3339))
+		q.Set("finalize", "true")
+		var usage struct {
+			Currency string       `json:"currency"`
+			Groups   []usageGroup `json:"groups"`
+		}
+		if err := s.getJSON(ctx, s.meteringURL+"/v1/customers/"+customerID+"/usage?"+q.Encode(), &usage); err != nil {
+			return fmt.Errorf("query usage: %w", err)
+		}
+		currency := usage.Currency
+		if currency == "" {
+			currency = "usd"
+		}
+		// 2. Push the period's usage to Stripe as pending invoice items.
+		for _, g := range usage.Groups {
+			if g.UsageMicros <= 0 {
+				continue
+			}
+			desc := usageDesc(g.Dimensions, period)
+			if err := s.addInvoiceItem(ctx, customerID, g.UsageMicros, currency, desc, g.Quantity, g.UnitPriceMicros); err != nil {
+				return err
+			}
+		}
 	}
 
-	// 2. Add one metered usage line per group_by value (micros, with quantity +
-	//    unit price). Flat-fee subscriptions are added by Stripe when the invoice
-	//    is made; the invoice total is rounded to cents once, by Stripe.
-	for _, g := range billed.Groups {
-		if g.UsageMicros <= 0 {
-			continue
-		}
-		desc := usageDesc(g.Dimensions, billed.Period)
-		if err := s.addInvoiceItem(ctx, e.CustomerID, g.UsageMicros, currency, desc, g.Quantity, g.UnitPriceMicros); err != nil {
-			return err
-		}
-	}
-
-	// 3. Create + finalize the invoice (pulls pending usage items + active
-	//    subscriptions) and collect payment.
+	// 3. Finalize ONE combined invoice for the container: flat fee (computed by
+	//    Stripe from its items + the period window) + the pushed usage items.
 	var inv struct {
 		ID        string `json:"id"`
 		AmountDue int    `json:"amount_due"`
@@ -396,19 +413,21 @@ func (s *Service) onBillingCycleEnded(ctx context.Context, e events.Event) error
 		Status    string `json:"status"`
 	}
 	if err := s.postJSON(ctx, s.baseURL+"/v1/invoices", map[string]any{
-		"customer": e.CustomerID,
-		"period":   billed.Period,
+		"customer":        customerID,
+		"subscription_id": stripeSubID,
+		"period":          period,
+		"period_start":    periodStart.Format(time.RFC3339),
+		"period_end":      periodEnd.Format(time.RFC3339),
+		"final":           final,
 	}, &inv); err != nil {
 		return fmt.Errorf("create invoice: %w", err)
 	}
-
-	// Nothing to bill (no usage and no active subscription) — skip.
 	if inv.AmountDue <= 0 {
-		s.log.Info("nothing to bill for period; skipping invoice", "customer", e.CustomerID, "period", billed.Period)
+		s.log.Info("nothing to bill for period; skipping invoice", "customer", customerID, "period", period)
 		return nil
 	}
-	s.log.Info("stripe invoice created", "id", inv.ID, "customer", e.CustomerID,
-		"amount_cents", inv.AmountDue, "paid", inv.Paid)
+	s.log.Info("stripe invoice finalized", "id", inv.ID, "customer", customerID,
+		"period", period, "amount_cents", inv.AmountDue, "paid", inv.Paid)
 
 	// 4. Map the provider outcome onto domain events.
 	payload, _ := json.Marshal(map[string]any{
@@ -419,13 +438,12 @@ func (s *Service) onBillingCycleEnded(ctx context.Context, e events.Event) error
 	if err := s.bus.Publish(ctx, events.Event{
 		ID:         events.NewID(),
 		Type:       events.InvoiceFinalized,
-		CustomerID: e.CustomerID,
+		CustomerID: customerID,
 		OccurredAt: time.Now().UTC(),
 		Payload:    payload,
 	}); err != nil {
 		return err
 	}
-
 	outcome := events.PaymentSucceeded
 	if !inv.Paid {
 		outcome = events.PaymentFailed
@@ -433,7 +451,7 @@ func (s *Service) onBillingCycleEnded(ctx context.Context, e events.Event) error
 	return s.bus.Publish(ctx, events.Event{
 		ID:         events.NewID(),
 		Type:       outcome,
-		CustomerID: e.CustomerID,
+		CustomerID: customerID,
 		OccurredAt: time.Now().UTC(),
 		Payload:    payload,
 	})
@@ -516,9 +534,11 @@ func (s *Service) deleteURL(ctx context.Context, url string) error {
 	return nil
 }
 
-// handleWebhook receives subscription lifecycle webhooks from fakestripe, updates
-// the link record, and publishes the corresponding domain event on the bus (the
-// observable "fact" of the create/cancel).
+// handleWebhook receives Stripe webhooks from fakestripe:
+//   - customer.subscription.created: mark the link record active, publish the fact.
+//   - invoice.upcoming: finalize the invoice for the subscription's ended (or, when
+//     final, partial) period — pulling that window's usage and billing it with the
+//     subscription fee. A final one also marks the record canceled.
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.webhookSecret != "" && r.Header.Get("X-Webhook-Secret") != s.webhookSecret {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
@@ -528,12 +548,22 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		Type string `json:"type"`
 		Data struct {
 			Object struct {
-				ID       string            `json:"id"`
-				Customer string            `json:"customer"`
-				Status   string            `json:"status"`
-				Metadata map[string]string `json:"metadata"`
+				ID               string            `json:"id"`
+				Customer         string            `json:"customer"`
+				Status           string            `json:"status"`
+				Items            []string          `json:"items"`
+				Metadata         map[string]string `json:"metadata"`
+				CurrentPeriodEnd string            `json:"current_period_end"`
+				Period           int               `json:"period"`
 			} `json:"object"`
 		} `json:"data"`
+		BillingPeriod struct {
+			Start     string `json:"start"`
+			End       string `json:"end"`
+			Period    int    `json:"period"`
+			Final     bool   `json:"final"`
+			BillUsage bool   `json:"bill_usage"`
+		} `json:"billing_period"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
 		http.Error(w, "bad webhook payload", http.StatusBadRequest)
@@ -541,8 +571,8 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	obj := evt.Data.Object
 
-	// Correlate to our link record by the metadata id set at create time, falling
-	// back to the Stripe subscription id.
+	// Correlate to our link record by the metadata id set at create time, then the
+	// Stripe subscription id, then the customer (one container per customer).
 	s.subMu.Lock()
 	sub := s.subs[obj.Metadata["invoicing_subscription_id"]]
 	if sub == nil {
@@ -554,6 +584,11 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if sub == nil {
+		if id, ok := s.subByCustomer[obj.Customer]; ok {
+			sub = s.subs[id]
+		}
+	}
+	if sub == nil {
 		s.subMu.Unlock()
 		s.log.Error("webhook for unknown subscription", "type", evt.Type, "stripe_id", obj.ID)
 		w.WriteHeader(http.StatusOK) // ack so the provider doesn't retry forever
@@ -562,37 +597,67 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if sub.StripeSubscriptionID == "" {
 		sub.StripeSubscriptionID = obj.ID
 	}
-	var busType events.Type
+	// Sync the container's items + period from Stripe.
+	sub.Items = obj.Items
+	if obj.CurrentPeriodEnd != "" {
+		sub.CurrentPeriodEnd = obj.CurrentPeriodEnd
+		sub.Period = obj.Period
+	}
+
 	switch evt.Type {
 	case "customer.subscription.created":
 		sub.Status = "active"
-		busType = events.SubscriptionCreated
-	case "customer.subscription.deleted":
-		sub.Status = "canceled"
-		busType = events.SubscriptionCancelled
+		record := *sub
+		s.subMu.Unlock()
+		s.publishSubscriptionFact(r.Context(), events.SubscriptionCreated, record)
+
+	case "customer.subscription.updated":
+		if obj.Status != "" {
+			sub.Status = obj.Status
+		}
+		s.subMu.Unlock()
+
+	case "invoice.upcoming":
+		if evt.BillingPeriod.Final {
+			sub.Status = "canceled"
+			sub.Items = nil
+		}
+		record := *sub
+		s.subMu.Unlock()
+		start, _ := time.Parse(time.RFC3339, evt.BillingPeriod.Start)
+		end, _ := time.Parse(time.RFC3339, evt.BillingPeriod.End)
+		if err := s.finalizeSubscriptionInvoice(r.Context(), record.CustomerID, record.StripeSubscriptionID,
+			start, end, evt.BillingPeriod.Period, evt.BillingPeriod.Final, evt.BillingPeriod.BillUsage); err != nil {
+			s.log.Error("finalize subscription invoice failed", "err", err)
+		}
+		if evt.BillingPeriod.Final {
+			s.publishSubscriptionFact(r.Context(), events.SubscriptionCancelled, record)
+			s.subMu.Lock()
+			delete(s.subByCustomer, record.CustomerID)
+			s.subMu.Unlock()
+		}
+
 	default:
 		s.subMu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		return
 	}
-	record := *sub
-	s.subMu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
 
-	s.log.Info("subscription webhook", "type", evt.Type, "id", record.ID, "stripe_id", record.StripeSubscriptionID)
+// publishSubscriptionFact emits a subscription lifecycle event on the bus.
+func (s *Service) publishSubscriptionFact(ctx context.Context, t events.Type, record Subscription) {
 	payload, _ := json.Marshal(map[string]any{
 		"subscription_id":        record.ID,
 		"stripe_subscription_id": record.StripeSubscriptionID,
 	})
-	if err := s.bus.Publish(r.Context(), events.Event{
+	if err := s.bus.Publish(ctx, events.Event{
 		ID:         events.NewID(),
-		Type:       busType,
+		Type:       t,
 		CustomerID: record.CustomerID,
 		OccurredAt: time.Now().UTC(),
 		Payload:    payload,
 	}); err != nil {
 		s.log.Error("publish subscription event failed", "err", err)
 	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Service) postJSON(ctx context.Context, url string, in, out any) error {

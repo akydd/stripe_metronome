@@ -3,12 +3,16 @@
 // managed by Stripe, not here).
 //
 // Like a real Metronome billable metric, it aggregates usage generically: events
-// carry arbitrary properties, and usage is summed and grouped by a configured set
-// of group_by dimensions — the fake has no knowledge of what those properties
-// mean. Amounts are carried in micros (1 USD = 1,000,000 micros) with no rounding;
-// Stripe rounds the invoice total to cents once. close-period returns the grouped
-// priced breakdown and opens a fresh period so late usage rolls over. Swap it for
-// the real API via METRONOME_BASE_URL.
+// carry arbitrary properties and a timestamp, and usage is summed and grouped by a
+// configured set of group_by dimensions — the fake has no knowledge of what those
+// properties mean. Amounts are carried in micros (1 USD = 1,000,000 micros) with
+// no rounding; Stripe rounds the invoice total to cents once.
+//
+// Crucially, usage is stored per-event with its timestamp, so costs can be queried
+// for an ARBITRARY time window (like Metronome's list-costs with a range). That's
+// what lets a caller bill usage for a period defined elsewhere (e.g. a Stripe
+// subscription's cycle) without Metronome's own schedule needing to match. Swap it
+// for the real API via METRONOME_BASE_URL.
 package fakemetronome
 
 import (
@@ -24,70 +28,52 @@ import (
 // costPerRequestMicros is the price per API request in micros ($0.0001 = 100).
 const costPerRequestMicros = 100
 
-// Service holds in-memory draft usage per customer.
+// Service holds in-memory per-event usage per customer.
 type Service struct {
 	log     *slog.Logger
 	groupBy []string // event properties to group usage by (nil = no grouping)
 	mu      sync.Mutex
-	drafts  map[string]*draft
-	seen    map[string]bool // transaction_id dedup (real Metronome dedups 34 days)
+	events  map[string][]usageRecord // customer -> timestamped usage records
+	// billedThrough is the end of the last window billed for a customer; the
+	// unwindowed costs read (the mid-cycle preview) returns only usage after it,
+	// so the preview resets to ~zero once a period is finalized.
+	billedThrough map[string]time.Time
+	seen          map[string]bool // transaction_id dedup (real Metronome dedups 34 days)
 }
 
-// draft is the accruing usage for a customer's open period, bucketed by the tuple
-// of group_by dimension values.
-type draft struct {
-	Period    int
-	UpdatedAt string
-	groups    map[string]*groupAgg // composite key -> aggregate
+// usageRecord is one metered event: when it occurred, its group_by dimensions,
+// and its quantity. Stored per-event so costs can be aggregated over any window.
+type usageRecord struct {
+	At       time.Time
+	DimKey   string
+	Dims     map[string]string
+	Quantity float64
 }
 
 type groupAgg struct {
-	Dimensions map[string]string // dimension name -> value for this bucket
+	Dimensions map[string]string
 	Events     int
 	Quantity   float64
-}
-
-// group is one dimension-tuple's priced usage for the period, in micros.
-type group struct {
-	Dimensions      map[string]string `json:"dimensions"`
-	Events          int               `json:"events"`
-	Quantity        float64           `json:"quantity"`
-	UnitPriceMicros int64             `json:"unit_price_micros"`
-	UsageMicros     int64             `json:"usage_micros"`
-}
-
-// snapshot is the priced usage view returned to callers (amounts in micros).
-type snapshot struct {
-	CustomerID      string   `json:"customer_id"`
-	Period          int      `json:"period"`
-	GroupBy         []string `json:"group_by"`
-	Groups          []group  `json:"groups"`
-	Quantity        float64  `json:"quantity"`
-	UnitPriceMicros int64    `json:"unit_price_micros"`
-	UsageMicros     int64    `json:"usage_micros"`
-	Currency        string   `json:"currency"`
-	Finalized       bool     `json:"finalized"`
-	UpdatedAt       string   `json:"updated_at"`
 }
 
 // New constructs the fake Metronome service. groupBy names the event properties
 // the billable metric aggregates by (empty = a single aggregate, no grouping).
 func New(log *slog.Logger, groupBy []string) *Service {
-	return &Service{log: log, groupBy: groupBy, drafts: map[string]*draft{}, seen: map[string]bool{}}
+	return &Service{
+		log:           log,
+		groupBy:       groupBy,
+		events:        map[string][]usageRecord{},
+		billedThrough: map[string]time.Time{},
+		seen:          map[string]bool{},
+	}
 }
 
-// Register wires the fake's HTTP routes.
+// Register wires the fake's HTTP routes: POST /ingest and the costs read mirror
+// real Metronome (v1.usage.ingest and v1.customers.listCosts). The costs read
+// accepts an optional ?start=&end= window and ?finalize=true.
 func (s *Service) Register(mux *http.ServeMux) {
-	// POST /v1/ingest and the costs read mirror real Metronome endpoints
-	// (v1.usage.ingest and v1.customers.listCosts).
 	mux.HandleFunc("POST /ingest", s.handleIngest)
 	mux.HandleFunc("GET /v1/customers/{id}/costs", s.handleCosts)
-
-	// DEMO SHIM: real Metronome has NO on-demand "close period" endpoint —
-	// billing periods are contract/schedule-driven and invoices auto-finalize
-	// after the grace period. This exists only so the demo can bill on demand
-	// instead of waiting for a real period boundary.
-	mux.HandleFunc("POST /v1/customers/{id}/close-period", s.handleClosePeriod)
 }
 
 // costLine mirrors an entry in Metronome's list-costs line_item_breakdown
@@ -118,15 +104,6 @@ type ingestEvent struct {
 	Timestamp     string         `json:"timestamp"`
 	EventType     string         `json:"event_type"`
 	Properties    map[string]any `json:"properties"`
-}
-
-func (s *Service) current(customer string) *draft {
-	d := s.drafts[customer]
-	if d == nil {
-		d = &draft{groups: map[string]*groupAgg{}}
-		s.drafts[customer] = d
-	}
-	return d
 }
 
 // dimsFor returns the group_by dimension values for an event and a stable
@@ -160,47 +137,9 @@ func propString(v any) string {
 	}
 }
 
-func (s *Service) snapshotLocked(customer string, finalized bool) snapshot {
-	d := s.current(customer)
-	keys := make([]string, 0, len(d.groups))
-	for k := range d.groups {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	groups := make([]group, 0, len(keys))
-	totalQty := 0.0
-	var totalMicros int64
-	for _, k := range keys {
-		g := d.groups[k]
-		micros := int64(g.Quantity) * costPerRequestMicros
-		groups = append(groups, group{
-			Dimensions:      g.Dimensions,
-			Events:          g.Events,
-			Quantity:        g.Quantity,
-			UnitPriceMicros: costPerRequestMicros,
-			UsageMicros:     micros,
-		})
-		totalQty += g.Quantity
-		totalMicros += micros
-	}
-	return snapshot{
-		CustomerID:      customer,
-		Period:          d.Period,
-		GroupBy:         s.groupBy,
-		Groups:          groups,
-		Quantity:        totalQty,
-		UnitPriceMicros: costPerRequestMicros,
-		UsageMicros:     totalMicros,
-		Currency:        "usd",
-		Finalized:       finalized,
-		UpdatedAt:       d.UpdatedAt,
-	}
-}
-
 // handleIngest accepts a batch (JSON array) of usage events, dedups by
-// transaction_id, and accrues them onto the customer's open period, grouped by
-// the configured group_by dimensions.
+// transaction_id, and stores each as a timestamped record grouped by the
+// configured group_by dimensions.
 func (s *Service) handleIngest(w http.ResponseWriter, r *http.Request) {
 	var batch []ingestEvent
 	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
@@ -224,20 +163,18 @@ func (s *Service) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}
 		s.seen[e.TransactionID] = true
 
-		d := s.current(e.CustomerID)
+		at, err := time.Parse(time.RFC3339, e.Timestamp)
+		if err != nil {
+			at = time.Now().UTC()
+		}
 		dims, key := s.dimsFor(e)
 		q := 1.0
 		if v, ok := e.Properties["quantity"].(float64); ok && v != 0 {
 			q = v
 		}
-		g := d.groups[key]
-		if g == nil {
-			g = &groupAgg{Dimensions: dims}
-			d.groups[key] = g
-		}
-		g.Events++
-		g.Quantity += q
-		d.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		s.events[e.CustomerID] = append(s.events[e.CustomerID], usageRecord{
+			At: at.UTC(), DimKey: key, Dims: dims, Quantity: q,
+		})
 		accepted++
 	}
 	s.mu.Unlock()
@@ -245,25 +182,54 @@ func (s *Service) handleIngest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int{"accepted": accepted, "duplicates": dupes})
 }
 
-// handleCosts returns the customer's current priced usage as a list-costs
-// response (like Metronome's v1.customers.listCosts): one window covering the
-// open period, with a per-group line_item_breakdown.
+// handleCosts returns priced usage as a list-costs response. With ?start=&end=
+// (RFC3339) it aggregates only events whose timestamp is in [start, end); without
+// a window it returns usage since the customer's billedThrough watermark (the
+// current, not-yet-billed usage — used by the mid-cycle preview). ?finalize=true
+// advances the watermark to `end`, so the just-billed usage drops off the preview.
 func (s *Service) handleCosts(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	unitPrice := float64(costPerRequestMicros) / 1e6
+	q := r.URL.Query()
+	start, hasStart := parseTime(q.Get("start"))
+	end, hasEnd := parseTime(q.Get("end"))
+	finalize := q.Get("finalize") == "true"
 
 	s.mu.Lock()
-	d := s.current(id)
-	keys := make([]string, 0, len(d.groups))
-	for k := range d.groups {
+	lo := start
+	if !hasStart {
+		lo = s.billedThrough[id] // preview: everything since the last finalize
+	}
+	agg := map[string]*groupAgg{}
+	for _, rec := range s.events[id] {
+		if rec.At.Before(lo) {
+			continue
+		}
+		if hasEnd && !rec.At.Before(end) { // rec.At >= end
+			continue
+		}
+		g := agg[rec.DimKey]
+		if g == nil {
+			g = &groupAgg{Dimensions: rec.Dims}
+			agg[rec.DimKey] = g
+		}
+		g.Events++
+		g.Quantity += rec.Quantity
+	}
+	if finalize && hasEnd {
+		s.billedThrough[id] = end
+	}
+	s.mu.Unlock()
+
+	unitPrice := float64(costPerRequestMicros) / 1e6
+	keys := make([]string, 0, len(agg))
+	for k := range agg {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
 	lines := make([]costLine, 0, len(keys))
 	var total float64
 	for _, k := range keys {
-		g := d.groups[k]
+		g := agg[k]
 		cost := float64(int64(g.Quantity)*costPerRequestMicros) / 1e6
 		lines = append(lines, costLine{
 			Name:      "API requests",
@@ -274,29 +240,29 @@ func (s *Service) handleCosts(w http.ResponseWriter, r *http.Request) {
 		})
 		total += cost
 	}
-	updated := d.UpdatedAt
-	s.mu.Unlock()
 
+	endStr := time.Now().UTC().Format(time.RFC3339)
+	if hasEnd {
+		endStr = end.Format(time.RFC3339)
+	}
 	writeJSON(w, http.StatusOK, costsResponse{Data: []costWindow{{
-		StartingOn:        updated,
-		EndingBefore:      time.Now().UTC().Format(time.RFC3339),
+		StartingOn:        lo.Format(time.RFC3339),
+		EndingBefore:      endStr,
 		LineItemBreakdown: lines,
 		TotalCost:         total,
 	}}})
 }
 
-// handleClosePeriod snapshots the priced usage for the closing period and opens a
-// fresh period, so late usage rolls over to the next invoice.
-func (s *Service) handleClosePeriod(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	s.mu.Lock()
-	snap := s.snapshotLocked(id, true)
-	s.drafts[id] = &draft{Period: snap.Period + 1, groups: map[string]*groupAgg{}}
-	s.mu.Unlock()
-
-	s.log.Info("closed period", "customer", id, "period", snap.Period,
-		"usage_micros", snap.UsageMicros, "groups", len(snap.Groups))
-	writeJSON(w, http.StatusOK, snap)
+// parseTime parses an RFC3339 timestamp, reporting whether it was present/valid.
+func parseTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

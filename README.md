@@ -18,12 +18,12 @@ billing` for customer validation).
 
 | Service     | Binary            | Default addr | Responsibility |
 |-------------|-------------------|--------------|----------------|
-| `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping), the billing-cycle boundary (`billing_cycle.ended`), and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
-| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP and confirms them via the Stripe **webhook** (`POST /webhooks/stripe`), publishing `subscription.created`/`cancelled` on the bus. On `billing_cycle.ended`, queries Metronome for usage and creates the invoice (usage items + subscription fees). Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
+| `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping) and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
+| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP; reacts to Stripe **webhooks** (`POST /webhooks/stripe`): `customer.subscription.created` and `invoice.upcoming`. At each subscription's period boundary it pulls that window's usage from Metronome, pushes it to Stripe as invoice items, and finalizes one invoice (fee + usage), mapping the outcome onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
 | `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
-| `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs) mirror real endpoints. `close-period` is a **demo shim** (real Metronome has no such call). Swap via `METRONOME_BASE_URL`. |
+| `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs). Usage is stored per-event with its timestamp, so costs can be queried for an **arbitrary window** (`?start=&end=`) — that's what lets a caller bill usage for a period defined by Stripe. Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
-| `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for **usage generator** processes (`/v1/generators`): they tick and publish `usage.ingested`. Also relays flat-fee **subscription** create/cancel (`/v1/subscriptions`) to the invoicing service (which owns them). Frontend calls it directly. |
+| `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for **usage generator** processes (`/v1/generators`): they tick and publish `usage.ingested`. Also relays **subscription item** add/remove (`/v1/subscriptions`, `/v1/subscriptions/remove-item`) to the invoicing service (which owns the subscription container). Frontend calls it directly. |
 | `eventfeed` | `cmd/eventfeed`   | `:8086`  | **Read-only** live view of the bus. Tails every event topic into a bounded in-memory ring (last ~500) and serves it at `GET /v1/events` for the frontend's **Live events** panel. Consumes only — no produce path — so it is safe to expose publicly (this is the recruiter-facing way to watch events, in place of the Console). |
 
 Override a listen address with `<SERVICE>_HTTP_ADDR` (e.g. `BILLING_HTTP_ADDR`).
@@ -38,34 +38,31 @@ Stripe APIs.
 
 ```
 control     frontend ─HTTP─▶ controlplane (/v1/generators…)      provision / start / stop
-(HTTP)      frontend ─HTTP─▶ billing (/v1/customers, …/close)    customers, cycle boundary
+(HTTP)      frontend ─HTTP─▶ billing (/v1/customers)            customers
 
 usage       controlplane usage process ─usage.ingested─▶ [bus] ─▶ metering
-(bus)                                                              │  late = occurred_at < period_start
-                                                                   └─(batch)─▶ Metronome  (meter; invoicing off)
+(bus)                                                              └─(batch)─▶ Metronome  (meter, per-event + timestamp)
 
 subs        frontend ─HTTP─▶ controlplane ─HTTP─▶ invoicing ─create/cancel─▶ Stripe
-(cmd+event)          Stripe ─webhook─▶ invoicing ─subscription.created/cancelled─▶ [bus]   (the "fact")
+(cmd+event)          Stripe ─webhook (subscription.created)─▶ invoicing ─subscription.created─▶ [bus]
 
 mid-cycle   frontend ─HTTP─▶ invoicing (/v1/customers/{id}/upcoming-invoice)
-(read)                        ├─ list-costs ◀── metering ◀── Metronome   (priced usage, grouped)
+(read)                        ├─ usage (since last finalize) ◀── metering ◀── Metronome
                               └─ subscriptions ◀── Stripe
 
-cycle end   frontend ─▶ billing (…/close) ─billing_cycle.ended─▶ [bus] ─┬─▶ invoicing
-                                                                        └─▶ metering  (records period boundary)
-            invoicing ── close-period (shim) ──▶ Metronome              (finalized priced usage)
-            invoicing ── invoice items + invoice ─▶ Stripe              (+ active subscriptions)
-            invoicing ─invoice.finalized, payment.succeeded/failed─▶ [bus] ─▶ billing
+period end  Stripe advances a subscription's period (timer) ─webhook (invoice.upcoming)─▶ invoicing
+(provider     invoicing ── pull usage for [period_start, period_end) ◀── metering ◀── Metronome
+ driven)      invoicing ── push usage items, then finalize ─▶ Stripe   (invoice = fee + usage)
+              invoicing ─invoice.finalized, payment.succeeded/failed─▶ [bus] ─▶ billing
 ```
 
 Notes:
-- **Lateness** is determined by `metering` (event `occurred_at` vs the period
-  start it learns from `billing_cycle.ended`), stamped as a `late` dimension, and
-  billed as its own line. The source never marks lateness — see *Late-arriving usage*.
-- **`billing_cycle.ended` has two consumers**: `invoicing` (to invoice) and
-  `metering` (to record the new period boundary).
-- **`close-period` is a demo shim** (real Metronome has no such call) — see
-  *Metronome API fidelity*.
+- **The provider owns the billing cycle.** There is no manual "close": each Stripe
+  subscription has its own period (30s in the demo); when it ends, Stripe fires an
+  `invoice.upcoming` webhook and `invoicing` finalizes one invoice = the flat fee
+  **+** that period's usage. See *Billing periods & windowed usage*.
+- **Usage is billed for an exact window.** `invoicing` queries Metronome for
+  `[period_start, period_end)`, so Metronome's own schedule need not match Stripe's.
 
 Event types live in `internal/events/event.go`, each doubling as its Kafka topic
 name. Two `Bus` implementations sit behind one interface:
@@ -120,17 +117,37 @@ make web-dev        # vite dev server (proxies /v1 to billing; full routing need
 Brings up Redpanda + Console + all services (on the Kafka bus) + the web app:
 
 ```sh
-docker compose up --build
+docker compose up --build        # add -d to run in the background
 ```
 
-Then open:
+### Viewing the two UIs locally
 
-- **App**: <http://localhost/> — includes a **Live events** panel (read-only tail
-  of the bus, served by `eventfeed`).
-- **Redpanda Console** (fuller UI): <http://localhost:8080> — bound to localhost
-  only. On the deployed instance it isn't exposed publicly; reach it by forwarding
-  its port over AWS SSM (see the Terraform `console_tunnel` output), then open
-  <http://localhost:8080>.
+Both UIs are served straight from the Compose stack — no tunnel needed locally:
+
+- **Billing Console (the app)** → <http://localhost/> &nbsp;*(port 80, the `web`
+  container)*. The main demo UI: customers, generators, subscriptions, invoices,
+  and a read-only **Live events** panel (the Kafka tail served by `eventfeed`).
+- **Redpanda Console** → <http://localhost:8080> &nbsp;*(the `console` container)*.
+  A fuller broker UI to browse topics (`usage.ingested`, `subscription.created`,
+  `invoice.finalized`, …) and inspect individual messages, partitions, and offsets.
+
+The Redpanda **Kafka broker** itself is published on `localhost:19092` for Kafka
+tooling (`kcat`, a local `rpk`, …) — it speaks the Kafka wire protocol, so it's not
+a web page; don't open it in a browser.
+
+> **If <http://localhost:8080> doesn't load** but the app on :80 does, the `console`
+> container is likely a stale one started without its port mapping. Recreate it to
+> apply the current Compose config:
+> ```sh
+> docker compose up -d --force-recreate console   # then reload http://localhost:8080
+> ```
+> (A plain restart or `up` can silently reuse an old container; `--force-recreate`
+> — on `console` or the whole stack — guarantees it matches `docker-compose.yml`.)
+
+The Redpanda Console is bound to **localhost only** (`127.0.0.1:8080`), so on the
+deployed EC2 instance it isn't exposed publicly — reach it there by forwarding its
+port over AWS SSM (see the Terraform `console_tunnel` output), then open
+<http://localhost:8080>.
 
 ### Watch the billing lifecycle
 
@@ -168,66 +185,43 @@ curl http://localhost/v1/customers/$CUST/upcoming-invoice
 #  "upcoming":true,...}
 ```
 
-**4. Close the billing cycle** — billing emits `billing_cycle.ended`; the
-`invoicing` service pulls the priced usage from Metronome and invoices it:
+**4. Add subscription items** (a `flat_fee` and a `usage` item — together they
+define the customer's one container and its billing cycle). Created control plane →
+invoicing → Stripe, confirmed back via webhook (idempotent via the `Idempotency-Key`
+header). The container gets its own **30-second billing period** anchored at creation:
 
 ```sh
-curl -X POST http://localhost/v1/billing-cycles/$CUST/close
+curl -s http://localhost/v1/subscription-plan            # {"amount_cents":3000,"currency":"usd"}
+curl -s -X POST http://localhost/v1/subscriptions -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"customer_id\":\"$CUST\",\"item_type\":\"flat_fee\"}" | jq .   # creates the container
+curl -s -X POST http://localhost/v1/subscriptions -H "Idempotency-Key: $(uuidgen)" \
+  -d "{\"customer_id\":\"$CUST\",\"item_type\":\"usage\"}" | jq .      # adds the usage item
+curl -s http://localhost/v1/customers/$CUST/subscriptions | jq .   # one record: items [flat_fee, usage]
 ```
 
-Watch the invoicing chain light up in the **Live events** panel (or the Console),
-each hop on its own topic:
-
-```
-billing_cycle.ended → (invoicing queries metering) → invoice.finalized → payment.succeeded
-```
-
-Metering + pricing (via `fakemetronome`) and the invoice (via `fakestripe`) are
-real; only the provider APIs themselves are stubbed. The usage rate is a hardcoded
-**$0.0001 per API request** (see *Pricing & rounding* below). Zero-amount cycles
-are skipped (no invoice).
-
-**Hybrid billing:** add a flat-fee **subscription** too, then close the cycle. The
-invoice carries both a usage line (`Usage-based Billing · gen … (period N)`) and a
-`Flat-fee Subscription` line, because **Stripe** owns the subscription and adds its
-fee when it creates the invoice, alongside the metered-usage items the `invoicing`
-service pulled from Metronome. The subscription price is a **fixed plan price owned
-by Stripe** — the frontend can display it but not set it. Creating a subscription
-goes control plane → invoicing → Stripe, and Stripe confirms it back via webhook
-(the request is idempotent — the `Idempotency-Key` header dedupes a retry):
+**5. Wait for the period to end — no manual step.** When the subscription's 30s
+period elapses, Stripe fires `invoice.upcoming`; `invoicing` pulls that window's
+usage from Metronome, pushes it to Stripe as invoice items, and Stripe finalizes
+**one** invoice = the flat fee **+** the period's usage:
 
 ```sh
-curl -s http://localhost/v1/subscription-plan            # {"amount_cents":5000,"currency":"usd"}
-curl -s -X POST http://localhost/v1/subscriptions \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d "{\"customer_id\":\"$CUST\"}" | jq .    # -> {id: isub_…, status: "pending", stripe_subscription_id: sub_…}
-curl -s http://localhost/v1/customers/$CUST/subscriptions | jq .   # status flips to "active" after the webhook
-# then close the cycle as in step 4
+curl -s http://localhost/v1/customers/$CUST/invoices | jq '.[0].lines'
+# [ {"description":"Usage-based Billing · gen 1a2b3c4d (period 1)", ...},
+#   {"description":"Flat-fee Subscription", "amount_micros":30000000} ]
 ```
 
-**5. Late-arriving usage:** the `emit` endpoint **backdates** usage timestamps to
-simulate usage that occurred before the current period started (works even for a
-stopped generator). The `metering` service flags it late (`occurred_at <
-period_start`), so it bills as its own **`Usage-based Billing (late)`** line on
-the next invoice — separate from on-time usage. (Close a cycle first so a period
-boundary exists.)
-
-```sh
-curl -X POST "http://localhost/v1/generators/$ID/emit?count=2000"   # backdated -> late
-curl -X POST http://localhost/v1/billing-cycles/$CUST/close          # bills as a "Usage-based Billing (late)" line
-```
+Watch the chain light up in the **Live events** panel: `invoice.finalized →
+payment.succeeded`, unprompted. Metering + pricing (`fakemetronome`) and the
+invoice (`fakestripe`) are real; only the provider APIs are stubbed. Cancelling a
+subscription (`POST /v1/subscriptions/{id}/cancel`) fires a final `invoice.upcoming`
+that bills the **prorated** partial period + its usage, then drops the subscription.
 
 **Payment failure branch:** a customer whose id contains `fail` doesn't pay (e.g.
-create one named "Fail Co"), so the chain ends on `payment.failed`:
+create one named "Fail Co"), so its invoice ends on `payment.failed`.
 
-```sh
-FAIL=$(curl -s -X POST http://localhost/v1/customers -d '{"name":"Fail Co"}' | jq -r .id)
-ID=$(curl -s -X POST http://localhost/v1/generators \
-      -d "{\"customer_id\":\"$FAIL\",\"interval_ms\":2000}" | jq -r .id)
-curl -X POST http://localhost/v1/generators/$ID/start
-# ...let it emit, then:
-curl -X POST http://localhost/v1/billing-cycles/$FAIL/close
-```
+> **Note:** usage is billed by the subscription's period, so a customer with usage
+> but **no** subscription has no billing cycle and won't be invoiced — see
+> *Billing periods & windowed usage*.
 
 ## Pricing & rounding
 
@@ -256,58 +250,61 @@ The other lever real providers use — a **coarser billing unit** (e.g. "per 1,0
 requests") so sub-cent amounts rarely arise — is not used here; this project keeps
 the fine-grained per-request unit and relies on precise summation instead.
 
-**Subscription proration.** On the **mid-cycle preview**, a flat-fee subscription
-is shown *prorated* for the partial period — a `Flat-fee Subscription (prorated)`
-line at a default **$25** (vs the **$50** full-period plan price), with a note in the UI
-(`subscription_prorated` in the response). The **finalized invoice** at cycle close
-bills the **full period** ($50). Stripe owns the amounts (`fakestripe` exposes both
-`amount_cents` and `prorated_cents`); `invoicing` just picks the prorated one for
-the preview and labels it. The proration is a **fixed default**, not computed from
-elapsed period time — real Stripe prorates by the actual time fraction, and only
-when a subscription changes mid-period.
+**Subscriptions are containers with items.** A subscription is **one container per
+customer** with a billing period, holding a `flat_fee` item and/or a `usage`
+(metered) item — like a real Stripe Subscription with SubscriptionItems. The
+billing cycle belongs to the *container*, so all its items bill on **one combined
+invoice** each period. This is what lets flat-fee and usage bill together, and lets
+either be added or removed without disturbing the other.
 
-**Subscription cancellation.** Cancelling a flat-fee subscription mid-cycle
-(`POST /v1/subscriptions/{id}/cancel`) is **terminal** — it can never be resumed;
-a new subscription must be created in its place (a new entity, with its own ids).
-The cancelled subscription is **not** dropped immediately: it stays until the next
-invoice, which bills it at the **prorated** amount for the partial period it was
-active and lists it as `Flat-fee Subscription (cancelled, prorated)`, then removes
-it (so it never bills again). An **active** subscription, by contrast, bills the
-full period at close. The mid-cycle preview reflects the pending cancellation,
-showing the sub as `Flat-fee Subscription (cancelled, prorated)`.
+- **Flat fee**: **$30** per full 30-second period, prorated **time-based at
+  $1/second**. An item present for the whole period bills the full $30; one added
+  mid-period bills for the seconds remaining (added 10s in → $20). The mid-cycle
+  preview shows the flat fee accruing $1/s.
+- **Add an item** (`POST /v1/subscriptions {customer_id, item_type}`): creates the
+  container if the customer has none, else adds the item (idempotent via the
+  `Idempotency-Key` header). Stripe prorates a mid-period flat-fee add.
+- **Remove an item** (`POST /v1/subscriptions/remove-item {customer_id, item_type}`):
+  removing the flat-fee item stashes its prorated partial to bill on the *next*
+  combined invoice (`Flat-fee Subscription (proration)`), and the container keeps
+  running on the usage item — usage keeps billing. The subscription ends only when
+  its **last** item is removed (a final invoice, then the container is dropped).
 
-## Late-arriving usage
+`fakestripe` owns the container (period, items, the ticker, the webhooks);
+`invoicing` keeps a link record and finalizes each period's combined invoice.
 
-"Late" usage is usage whose event timestamp falls **before the customer's current
-billing period began** — i.e. it belongs to a period that already closed but was
-reported afterward. It's surfaced as its own invoice line
-(`Usage-based Billing (late) · …`), separate from on-time usage.
+## Billing periods & windowed usage
 
-Two design rules make this faithful to how you'd build it on real Metronome:
+The hard part of composing two billing systems is that **you can't assume
+Metronome's usage schedule matches Stripe's subscription schedule** (different
+anchors, grace windows, cadence). This project resolves that by picking a single
+authority: **the Stripe subscription's period is the billing cycle**, and Metronome
+is treated as a metering store queried for that exact window.
 
-- **The source does not decide lateness.** `controlplane` only reports *when*
-  usage occurred (an `occurred_at` timestamp); it has no concept of billing
-  periods. The `emit` endpoint *simulates* a late arrival by **backdating** that
-  timestamp — not by setting a flag.
-- **Metronome can't determine lateness either.** Real Metronome assigns events to
-  periods by timestamp and offers a grace period, but a billable metric can only
-  **group by properties you send** — there is no built-in "late" dimension. So
-  neither `fakemetronome` nor real Metronome computes it.
+- Each Stripe subscription (`fakestripe`) has its own period — **30 seconds** in
+  the demo, anchored at creation (compressed so a cycle is watchable). Stripe rolls
+  it forward like `current_period_end`.
+- At each boundary Stripe fires an **`invoice.upcoming`** webhook. `invoicing`
+  reacts: it queries Metronome for usage in `[period_start, period_end)`, pushes
+  those as invoice items, and Stripe finalizes **one** invoice = the subscription
+  fee **+** that period's usage. This mirrors how you'd add externally-metered
+  usage to a Stripe subscription invoice before it finalizes.
+- Because usage is pulled for an **arbitrary window**, Metronome's own schedule
+  never has to align with Stripe's. `fakemetronome` stores each event with its
+  timestamp and aggregates over any `[start, end)`; a `billedThrough` watermark
+  makes the mid-cycle preview reset once a period is finalized.
 
-Lateness is therefore **determined by the `metering` ingestion service** (the
-layer that enriches events before sending them to Metronome):
+Example use case: a customer starts a monthly subscription, then begins metered
+usage 10 days in. At the subscription's month end, the invoice carries the flat fee
+**and** the 10-days-in-to-month-end usage — one invoice, because the subscription
+period defined the window and usage was pulled for exactly it.
 
-1. It learns each customer's current period start from `billing_cycle.ended`.
-2. On each usage event it computes `late = occurred_at < period_start`.
-3. It stamps `late` as an event **property**, so Metronome's `group_by`
-   (`generator_id, late`) splits on-time vs late into distinct groups → distinct
-   invoice lines. Metronome stays oblivious to what `late` means.
-
-Demo simplification: this project rolls late usage *forward by receipt* into the
-current period (so it bills on the next invoice) rather than modeling Metronome's
-grace-period/backdating-into-a-closed-period behavior. The determination
-mechanism (timestamp vs. period boundary, computed at ingestion) is the part that
-mirrors production.
+Known simplifications: usage is billed **by the subscription's period**, so a
+customer with usage but no subscription has no billing cycle (it wouldn't be
+invoiced); with multiple subscriptions on one customer, the first period to close
+sweeps up the customer's pending usage. A production build would give usage its own
+period authority and tie usage to a specific subscription item. The demo also does
+not model Metronome's grace window for late-arriving events.
 
 ## Metronome API fidelity
 
@@ -319,17 +316,15 @@ mirrors production.
 - **`GET /v1/customers/{id}/costs`** mirrors real Metronome's **list-costs**
   (`v1.customers.listCosts`) — a faithful subset returning priced usage as
   `data[].line_item_breakdown[]` (`name`, `groups`, `quantity`, `unit_price`,
-  `cost` in USD). This is the read the `metering` service uses for the mid-cycle
-  preview; real Metronome exposes mid-period *priced* usage via costs / the draft
-  invoice, not a bespoke usage endpoint.
+  `cost` in USD), and it accepts a **time window** (`?start=&end=`) like the real
+  API. `invoicing` uses the unwindowed read for the mid-cycle preview and the
+  windowed read to bill a subscription period exactly.
 
-**Known deliberate divergence:** `POST /v1/customers/{id}/close-period` is a
-**demo shim** — real Metronome has **no** on-demand "close/rotate a billing
-period" call; periods are contract/schedule-driven and invoices auto-finalize
-after the grace period. It exists only so the demo can bill on demand instead of
-waiting for a real period boundary. Lesser simplifications: the fake dedups
-indefinitely (real: 34-day window), doesn't reject future-dated or >34-day-old
-events, and uses one hardcoded rate instead of configured rate cards.
+**Known deliberate divergences:** the fake dedups `transaction_id` indefinitely
+(real: 34-day window), doesn't reject future-dated or >34-day-old events, and uses
+one hardcoded rate instead of configured rate cards. It also has no billing/invoice
+concept of its own — the demo lets Stripe's subscription period drive invoicing and
+pulls Metronome usage for that window, rather than using Metronome-native billing.
 
 ## Deploy to an AWS t4g.small
 
@@ -397,7 +392,7 @@ Layered, cheapest first:
 - **Service cache**: short-TTL (a few seconds) cache in `invoicing`, keyed by
   `customer_id + period`, with **single-flight** so concurrent misses for one
   customer collapse to a single Metronome read. Use a shared cache (Redis) once
-  there is more than one `invoicing` instance. Invalidate on `billing_cycle.ended`.
+  there is more than one `invoicing` instance. Invalidate when a period finalizes.
 - **Rate-limit backstop** toward Metronome so a cache-wide miss can't exceed its
   limits.
 - **Only if metrics demand it**: a materialized per-customer usage counter

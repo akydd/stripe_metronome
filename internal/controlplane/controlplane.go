@@ -82,8 +82,8 @@ func (m *Manager) Register(mux *http.ServeMux) {
 
 	// Flat-fee subscriptions: relay create/cancel to the invoicing service, which
 	// owns the subscription entity.
-	mux.HandleFunc("POST /v1/subscriptions", m.handleCreateSubscription)
-	mux.HandleFunc("POST /v1/subscriptions/{id}/cancel", m.handleCancelSubscription)
+	mux.HandleFunc("POST /v1/subscriptions", m.handleAddItem)
+	mux.HandleFunc("POST /v1/subscriptions/remove-item", m.handleRemoveItem)
 }
 
 // Close stops all running usage processes (used on shutdown).
@@ -233,12 +233,13 @@ func (m *Manager) handleList(w http.ResponseWriter, _ *http.Request) {
 
 // publishSubscription emits a subscription lifecycle event to the bus. No amount
 // is carried — Stripe owns the fixed plan price.
-// handleCreateSubscription relays a flat-fee subscription create to the invoicing
-// service (which owns the entity). It validates the customer first and forwards
-// the client's Idempotency-Key end-to-end so a retry can't double-create.
-func (m *Manager) handleCreateSubscription(w http.ResponseWriter, r *http.Request) {
+// handleAddItem relays "add a subscription item" (flat_fee or usage) to the
+// invoicing service (which owns the container). It validates the customer first
+// and forwards the client's Idempotency-Key end-to-end.
+func (m *Manager) handleAddItem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CustomerID string `json:"customer_id"`
+		ItemType   string `json:"item_type"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.CustomerID == "" {
@@ -249,14 +250,23 @@ func (m *Manager) handleCreateSubscription(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unknown customer", http.StatusBadRequest)
 		return
 	}
-	body, _ := json.Marshal(map[string]any{"customer_id": req.CustomerID})
+	body, _ := json.Marshal(map[string]any{"customer_id": req.CustomerID, "item_type": req.ItemType})
 	m.relay(w, r, http.MethodPost, m.invoicingURL+"/v1/subscriptions", body)
 }
 
-// handleCancelSubscription relays a cancel to the invoicing service.
-func (m *Manager) handleCancelSubscription(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	m.relay(w, r, http.MethodPost, m.invoicingURL+"/v1/subscriptions/"+id+"/cancel", nil)
+// handleRemoveItem relays "remove a subscription item" to the invoicing service.
+func (m *Manager) handleRemoveItem(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CustomerID string `json:"customer_id"`
+		ItemType   string `json:"item_type"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.CustomerID == "" || req.ItemType == "" {
+		http.Error(w, "customer_id and item_type required", http.StatusBadRequest)
+		return
+	}
+	body, _ := json.Marshal(map[string]any{"customer_id": req.CustomerID, "item_type": req.ItemType})
+	m.relay(w, r, http.MethodPost, m.invoicingURL+"/v1/subscriptions/remove-item", body)
 }
 
 // relay proxies a subscription command to invoicing, forwarding the Idempotency-Key
@@ -351,9 +361,9 @@ func (m *Manager) emitBatch(ctx context.Context, id, customer string, n int, occ
 	m.mu.Unlock()
 }
 
-// handleEmit fires one or more usage events on demand (?count=N), independent of
-// the tick loop and regardless of whether the process is running. Useful for
-// generating late-arriving usage after a billing cycle has been closed.
+// handleEmit fires one or more usage events on demand (?count=N), timestamped now,
+// independent of the tick loop and regardless of whether the process is running —
+// a quick way to generate a burst of usage in the current period.
 func (m *Manager) handleEmit(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	m.mu.Lock()
@@ -380,10 +390,7 @@ func (m *Manager) handleEmit(w http.ResponseWriter, r *http.Request) {
 	if count > 5000 {
 		count = 5000
 	}
-	// The emit endpoint simulates late-arriving usage by backdating when it
-	// occurred (an hour ago). Whether that's actually "late" is decided
-	// downstream by comparing this timestamp to the customer's period boundary.
-	occurredAt := time.Now().UTC().Add(-time.Hour)
+	occurredAt := time.Now().UTC()
 	m.emitBatch(r.Context(), id, cust, count, occurredAt)
 	writeJSON(w, http.StatusOK, map[string]any{"process": id, "emitted": count, "occurred_at": occurredAt})
 }

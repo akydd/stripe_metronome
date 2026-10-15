@@ -7,12 +7,10 @@ import {
   InvoiceLine,
   Subscription,
   UpcomingInvoice,
-  cancelSubscription,
-  closeCycle,
+  addSubscriptionItem,
   createCustomer,
-  createSubscription,
   deleteGenerator,
-  emitLate,
+  emitUsage,
   getEvents,
   getInvoices,
   getSubscriptionPlan,
@@ -21,6 +19,7 @@ import {
   listGenerators,
   listSubscriptions,
   provisionGenerator,
+  removeSubscriptionItem,
   startGenerator,
   stopGenerator,
 } from './api'
@@ -30,6 +29,16 @@ type InvoiceView =
   | { kind: 'all'; customer: string; finalized: Invoice[]; upcoming: UpcomingInvoice }
 
 const money = (cents: number) => `$${(cents / 100).toFixed(2)}`
+
+// countdown renders time remaining until an ISO deadline, given a current-time ms.
+function countdown(endISO: string, nowMs: number): string {
+  if (!endISO) return '—'
+  const ms = new Date(endISO).getTime() - nowMs
+  if (ms <= 0) return 'finalizing…'
+  const s = Math.ceil(ms / 1000)
+  if (s < 60) return `in ${s}s`
+  return `in ${Math.floor(s / 60)}m ${s % 60}s`
+}
 
 // fmtMicros shows a micros amount as dollars: 2 decimals when it's a whole cent,
 // otherwise up to 4 (so sub-cent usage is visible).
@@ -259,38 +268,45 @@ function HowToDemo() {
           </li>
           <li>
             <em>(Optional)</em> In <strong>Subscriptions</strong>, pick that customer and click{' '}
-            <strong>Add subscription</strong> — the mid-cycle preview now adds a <em>prorated</em>{' '}
-            flat-fee line ($25 of the $50 plan) on top of usage.
+            <strong>Add flat-fee</strong> — the mid-cycle preview adds a <em>prorated</em> flat-fee
+            line that accrues $1/s toward the $30 period fee.
           </li>
         </ol>
 
         <p className="mb-1">
-          <strong>Demo 2 — Late usage rolls into the current cycle</strong>
+          <strong>Demo 2 — Combined invoice + independent items</strong>
         </p>
         <p className="mb-1">
-          <em>Late usage</em> = events timestamped <strong>before the current billing period began</strong>{' '}
-          (they belong to a period that already closed). Rather than dropping them or reopening the
-          closed invoice, the system rolls them forward into the current cycle as a separate line.
+          A subscription is a container with a <strong>30-second period</strong> holding a{' '}
+          <strong>flat-fee</strong> and/or <strong>usage</strong> item. At the period end Stripe
+          auto-finalizes <em>one</em> invoice = the flat fee <strong>+</strong> that period's usage
+          (pulled from Metronome for the exact window). Removing the flat-fee item keeps usage
+          billing on the same cycle.
         </p>
         <ol className="mb-2">
           <li>
-            With a usage generator running (from Demo 1), click <strong>Close cycle</strong>. This
-            finalizes the first invoice and starts a fresh period — the boundary that defines "late."
+            In <strong>Subscriptions</strong>, click <strong>Add flat-fee</strong> and{' '}
+            <strong>Add usage</strong> for a customer, then provision + start a{' '}
+            <strong>usage generator</strong> for them.
           </li>
           <li>
-            Click <strong>Emit late</strong> a few times on that generator. Those events are
-            backdated to <em>before</em> the new period began.
+            Watch the subscription's <strong>Next invoice</strong> countdown. When it hits zero, no
+            click needed — an invoice finalizes on its own.
           </li>
           <li>
-            Click <strong>Mid-cycle</strong> again. A distinct{' '}
-            <strong>"Usage-based Billing (late)"</strong> line now appears alongside the current
-            period's on-time <strong>"Usage-based Billing"</strong> — the late events billed in
-            the current cycle, not the closed one.
+            Open <strong>All invoices</strong>: the finalized invoice shows both a{' '}
+            <strong>Flat-fee Subscription</strong> line and a <strong>Usage-based Billing</strong>{' '}
+            line for the period. The mid-cycle preview then resets for the next period.
+          </li>
+          <li>
+            Click <strong>Remove flat-fee</strong>: the container stays <em>active</em> on just the
+            usage item and keeps billing usage each period — cancelling the flat fee doesn't stop
+            usage billing.
           </li>
         </ol>
         <p className="text-secondary small mb-0">
-          Lateness is determined by the metering service from each event's timestamp versus the
-          period boundary — the sender never marks an event as late.
+          The subscription period is the billing authority; Metronome is queried for usage in that
+          exact window and pushed onto the Stripe invoice as line items before it finalizes.
         </p>
       </div>
     </div>
@@ -301,6 +317,7 @@ export function App() {
   const [customers, setCustomers] = useState<Customer[]>([])
   const [procs, setProcs] = useState<GeneratorProcess[]>([])
   const [subs, setSubs] = useState<Subscription[]>([])
+  const [now, setNow] = useState(() => Date.now())
   const [newName, setNewName] = useState('Acme Inc')
   const [selected, setSelected] = useState('')
   const [intervalMs, setIntervalMs] = useState(1000)
@@ -350,6 +367,12 @@ export function App() {
     const t = setInterval(refresh, 3000)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Tick every second so subscription countdowns stay live.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
   }, [])
 
   // Poll the selected customer's flat-fee subscriptions (owned by invoicing).
@@ -453,8 +476,8 @@ export function App() {
         </button>
       </div>
       <p className="text-secondary mb-1">
-        Metronome + Stripe demo — provision usage generators and flat-fee subscriptions, then close
-        a cycle to invoice.
+        Metronome + Stripe demo — provision usage generators and flat-fee subscriptions. Each
+        subscription auto-invoices at the end of its billing period (flat fee + that period's usage).
       </p>
       <p className="text-secondary small">
         <span className="badge text-bg-secondary">note</span> All demo data resets daily at{' '}
@@ -517,9 +540,6 @@ export function App() {
                     </button>
                     <button className="btn btn-outline-secondary" onClick={() => showInvoices(c.id)}>
                       All invoices
-                    </button>
-                    <button className="btn btn-outline-warning" onClick={() => run(() => closeCycle(c.id))}>
-                      Close cycle
                     </button>
                   </div>
                 </td>
@@ -693,10 +713,10 @@ export function App() {
                     )}
                     <button
                       className="btn btn-outline-primary"
-                      title="Emit one usage event now"
-                      onClick={() => run(() => emitLate(p.id))}
+                      title="Emit a burst of usage now"
+                      onClick={() => run(() => emitUsage(p.id, 10))}
                     >
-                      Emit late
+                      Emit usage
                     </button>
                     <button className="btn btn-outline-danger" onClick={() => run(() => deleteGenerator(p.id))}>
                       Delete
@@ -709,8 +729,14 @@ export function App() {
         </table>
       </div>
 
-      {/* Subscriptions (flat-fee) — owned by invoicing + fakestripe */}
+      {/* Subscriptions — one container per customer, holding flat_fee/usage items */}
       <h2 className="h5 mt-4">Subscriptions</h2>
+      <p className="text-secondary small mb-2">
+        A subscription is one container per customer with a billing period, holding a{' '}
+        <strong>flat-fee</strong> item ({planLabel}) and/or a <strong>usage</strong> item. At the
+        period end it bills all items on <em>one</em> combined
+        invoice. Removing the flat fee keeps usage billing; the subscription ends when it has no items.
+      </p>
       <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
         <select
           className="form-select form-select-sm w-auto"
@@ -724,15 +750,21 @@ export function App() {
             </option>
           ))}
         </select>
-        <span className="text-secondary small">fixed plan price: {planLabel}</span>
         <button
           className="btn btn-sm btn-primary"
           disabled={!selected}
-          onClick={() => runSub(() => createSubscription(selected))}
+          onClick={() => runSub(() => addSubscriptionItem(selected, 'flat_fee'))}
         >
-          Add subscription
+          Add flat-fee
         </button>
-        <span className="text-secondary small">showing subscriptions for the selected customer</span>
+        <button
+          className="btn btn-sm btn-outline-primary"
+          disabled={!selected}
+          onClick={() => runSub(() => addSubscriptionItem(selected, 'usage'))}
+        >
+          Add usage
+        </button>
+        <span className="text-secondary small">for the selected customer</span>
       </div>
 
       <div className="table-responsive">
@@ -741,16 +773,17 @@ export function App() {
             <tr>
               <th>Subscription</th>
               <th>Customer</th>
-              <th>Stripe sub</th>
+              <th>Items</th>
               <th>Status</th>
+              <th>Next invoice</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {subs.length === 0 && (
               <tr>
-                <td colSpan={5} className="text-secondary">
-                  No subscriptions for this customer.
+                <td colSpan={6} className="text-secondary">
+                  No subscription for this customer.
                 </td>
               </tr>
             )}
@@ -761,7 +794,18 @@ export function App() {
                 </td>
                 <td>{nameFor(s.customer_id)}</td>
                 <td>
-                  <code className="small">{s.stripe_subscription_id || '—'}</code>
+                  {(s.items ?? []).length === 0 ? (
+                    <span className="text-secondary small">—</span>
+                  ) : (
+                    (s.items ?? []).map((it) => (
+                      <span
+                        key={it}
+                        className={`badge me-1 ${it === 'flat_fee' ? 'text-bg-primary' : 'text-bg-info'}`}
+                      >
+                        {it === 'flat_fee' ? 'flat-fee' : 'usage'}
+                      </span>
+                    ))
+                  )}
                 </td>
                 <td>
                   <span
@@ -776,17 +820,28 @@ export function App() {
                     {s.status}
                   </span>
                 </td>
+                <td className="small text-secondary">
+                  {s.status === 'active' ? countdown(s.current_period_end, now) : '—'}
+                </td>
                 <td>
-                  {s.status === 'canceled' ? (
-                    <span className="text-secondary small">—</span>
-                  ) : (
-                    <button
-                      className="btn btn-sm btn-outline-danger"
-                      onClick={() => runSub(() => cancelSubscription(s.id))}
-                    >
-                      Cancel
-                    </button>
-                  )}
+                  <div className="btn-group btn-group-sm">
+                    {(s.items ?? []).includes('flat_fee') && (
+                      <button
+                        className="btn btn-outline-danger"
+                        onClick={() => runSub(() => removeSubscriptionItem(s.customer_id, 'flat_fee'))}
+                      >
+                        Remove flat-fee
+                      </button>
+                    )}
+                    {(s.items ?? []).includes('usage') && (
+                      <button
+                        className="btn btn-outline-secondary"
+                        onClick={() => runSub(() => removeSubscriptionItem(s.customer_id, 'usage'))}
+                      >
+                        Remove usage
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}

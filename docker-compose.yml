@@ -141,9 +141,9 @@ services:
     environment:
       FAKEMETRONOME_HTTP_ADDR: ":8083"
       # The billable metric's group_by dimensions (comma-separated event
-      # properties). Grouping by generator_id + late yields a distinct line per
-      # generator, split into on-time vs late usage.
-      METRONOME_GROUP_BY: generator_id,late
+      # properties). Grouping by generator_id yields a distinct usage line per
+      # generator on the invoice.
+      METRONOME_GROUP_BY: generator_id
     restart: unless-stopped
     deploy:
       resources:
