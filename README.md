@@ -9,36 +9,67 @@ stand-ins (`fakemetronome` / `fakestripe`).
 It's a working demo — single box, in-memory state (see *Production scaling*) — not
 a production system.
 
-## Architecture (C4 System Context)
+## Architecture (components & event flow)
 
-The system-context (C4 Level 1) view: who uses the platform and the external
-providers it integrates with. The internal event-driven detail — the Go services
-and the Kafka bus — is the container/component level; see *Services* and *Event
-flow* below.
+A component-level (≈ C4 Level 3) view, drawn as a sequence so the event-driven
+dynamics are visible: **solid arrows are synchronous HTTP** (commands and reads),
+**dashed arrows are asynchronous** (Kafka delivery, Stripe webhooks, responses).
+The static breakdown of each component is in *Services* below.
 
 ```mermaid
-C4Context
-    title System Context — stripe_metronome billing platform
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant W as Web (React + nginx)
+    participant CP as controlplane
+    participant B as billing
+    participant I as invoicing
+    participant M as metering
+    participant K as Kafka bus (Redpanda)
+    participant MM as Metronome (fakemetronome)
+    participant S as Stripe (fakestripe)
+    participant EF as eventfeed
 
-    Person(user, "User", "Operator / recruiter: manages customers, subscriptions and usage generators; views invoices and the live event feed")
+    Note over U,EF: 1 — Setup — synchronous HTTP commands
+    U->>W: create customer, add subscription items, start a usage generator
+    W->>B: POST /v1/customers
+    W->>CP: POST /v1/subscriptions {item_type: flat_fee / usage}
+    CP->>B: validate customer
+    CP->>I: relay add-item (Idempotency-Key)
+    I->>S: POST /v1/subscriptions (create container / add item)
+    S-->>I: webhook customer.subscription.created / updated
+    I->>K: publish subscription.created
+    W->>CP: POST /v1/generators + /start
 
-    System(platform, "Billing Platform (stripe_metronome)", "Event-driven usage + subscription billing: meters usage, runs per-subscription billing cycles, and issues one combined invoice per period")
+    Note over CP,MM: 2 — Usage metering — asynchronous (the event bus)
+    loop each generator tick
+        CP->>K: usage.ingested
+    end
+    K-->>M: deliver usage.ingested
+    M->>MM: POST /ingest (batched, per-event timestamps)
 
-    System_Ext(stripe, "Stripe", "Owns subscriptions & invoices; collects payment. Demo stand-in: fakestripe")
-    System_Ext(metronome, "Metronome", "Meters & prices usage; queried for an exact billing window. Demo stand-in: fakemetronome")
+    Note over S,B: 3 — Billing cycle — Stripe's timer → webhook → one combined invoice
+    S->>S: subscription period (30s) ends
+    S-->>I: webhook invoice.upcoming {period window, bill_usage}
+    I->>M: GET /usage?start&end&finalize (exact window)
+    M->>MM: GET /costs?start&end
+    MM-->>M: priced usage for the window
+    I->>S: POST /v1/invoiceitems (usage lines)
+    I->>S: POST /v1/invoices (finalize: flat fee + usage)
+    S-->>I: one combined invoice (paid / open)
+    I->>K: invoice.finalized, payment.succeeded / failed
+    K-->>B: payment outcome
 
-    Rel(user, platform, "Manages customers/subscriptions/usage; views invoices & live events", "HTTP")
-    Rel(platform, metronome, "Ingests usage; reads priced usage for a window (list-costs)", "HTTP")
-    Rel(platform, stripe, "Creates/cancels subscription items & invoice items; triggers finalize", "HTTP")
-    Rel(stripe, platform, "Webhooks: subscription.created, invoice.upcoming / finalized, payment outcome", "HTTP webhook")
-
-    UpdateLayoutConfig($c4ShapeInRow="2", $c4BoundaryInRow="1")
+    Note over U,EF: Reads — synchronous, no cycle needed
+    U->>W: mid-cycle preview / live events
+    W->>I: GET /upcoming-invoice (usage from M + prorated flat from S)
+    W->>EF: GET /v1/events
+    K-->>EF: tails every topic (read-only)
 ```
 
-The async **webhook from Stripe** (bottom relationship) is where the event-driven
-nature surfaces at this level: the platform issues commands over HTTP, and the
-provider reports lifecycle facts back asynchronously — which the platform then
-republishes onto its internal Kafka bus.
+The key shape: **commands are directed and synchronous (HTTP), facts are
+broadcast and asynchronous (Kafka events + Stripe webhooks)** — see *Billing
+periods & windowed usage* for why Stripe's subscription period drives invoicing.
 
 ## Services
 
