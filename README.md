@@ -9,6 +9,37 @@ stand-ins (`fakemetronome` / `fakestripe`).
 It's a working demo — single box, in-memory state (see *Production scaling*) — not
 a production system.
 
+## Architecture (C4 System Context)
+
+The system-context (C4 Level 1) view: who uses the platform and the external
+providers it integrates with. The internal event-driven detail — the Go services
+and the Kafka bus — is the container/component level; see *Services* and *Event
+flow* below.
+
+```mermaid
+C4Context
+    title System Context — stripe_metronome billing platform
+
+    Person(user, "User", "Operator / recruiter: manages customers, subscriptions and usage generators; views invoices and the live event feed")
+
+    System(platform, "Billing Platform (stripe_metronome)", "Event-driven usage + subscription billing: meters usage, runs per-subscription billing cycles, and issues one combined invoice per period")
+
+    System_Ext(stripe, "Stripe", "Owns subscriptions & invoices; collects payment. Demo stand-in: fakestripe")
+    System_Ext(metronome, "Metronome", "Meters & prices usage; queried for an exact billing window. Demo stand-in: fakemetronome")
+
+    Rel(user, platform, "Manages customers/subscriptions/usage; views invoices & live events", "HTTP")
+    Rel(platform, metronome, "Ingests usage; reads priced usage for a window (list-costs)", "HTTP")
+    Rel(platform, stripe, "Creates/cancels subscription items & invoice items; triggers finalize", "HTTP")
+    Rel(stripe, platform, "Webhooks: subscription.created, invoice.upcoming / finalized, payment outcome", "HTTP webhook")
+
+    UpdateLayoutConfig($c4ShapeInRow="2", $c4BoundaryInRow="1")
+```
+
+The async **webhook from Stripe** (bottom relationship) is where the event-driven
+nature surfaces at this level: the platform issues commands over HTTP, and the
+provider reports lifecycle facts back asynchronously — which the platform then
+republishes onto its internal Kafka bus.
+
 ## Services
 
 Each service is its own binary under `cmd/`. The **billing pipeline** flows over
