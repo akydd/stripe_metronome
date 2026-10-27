@@ -406,9 +406,21 @@ func (s *Service) billOpenInvoice(ctx context.Context, customerID, invoiceID str
 	}
 
 	// Finalize the draft (Stripe's auto_advance=false flow): the subscription fee was
-	// set on it at creation, and the usage items were just attached.
+	// set on it at creation, and the usage items were just attached. Collection is a
+	// separate step (payInvoice), kicked off when the invoice.finalized webhook lands.
 	if err := s.postJSON(ctx, s.baseURL+"/v1/invoices/"+invoiceID+"/finalize", nil, nil); err != nil {
 		return fmt.Errorf("finalize invoice %s: %w", invoiceID, err)
+	}
+	return nil
+}
+
+// payInvoice attempts collection on a finalized invoice (Stripe's pay endpoint).
+// With auto_advance off, Stripe doesn't collect automatically after finalization, so
+// the integration triggers it. The success/failure outcome arrives via a payment
+// webhook, where the bus fact is published.
+func (s *Service) payInvoice(ctx context.Context, invoiceID string) error {
+	if err := s.postJSON(ctx, s.baseURL+"/v1/invoices/"+invoiceID+"/pay", nil, nil); err != nil {
+		return fmt.Errorf("pay invoice %s: %w", invoiceID, err)
 	}
 	return nil
 }
@@ -513,8 +525,9 @@ func (s *Service) deleteURL(ctx context.Context, url string) error {
 //   - customer.subscription.created/updated: sync the link record; publish the fact.
 //   - invoice.created: a draft invoice is open for a period — attach that window's
 //     usage to it, then finalize it (the auto_advance=false flow).
-//   - invoice.finalized: the invoice is immutable now — publish the fact; a final
-//     invoice also marks the link record canceled.
+//   - invoice.finalized: the invoice is immutable now — publish the fact and, since
+//     auto_advance is off, trigger collection (the pay endpoint); a final invoice
+//     also marks the link record canceled.
 //   - invoice.payment_succeeded / invoice.payment_failed: publish the outcome.
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.webhookSecret != "" && r.Header.Get("X-Webhook-Secret") != s.webhookSecret {
@@ -592,6 +605,11 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		if obj.AmountDue > 0 {
 			if err := s.publishInvoiceFact(ctx, events.InvoiceFinalized, obj.Customer, obj.ID, obj.Status, obj.AmountDue); err != nil {
 				s.log.Error("publish invoice.finalized failed", "err", err)
+			}
+			// auto_advance is off, so Stripe won't collect on its own — attempt
+			// payment explicitly. The outcome returns via a payment webhook.
+			if err := s.payInvoice(ctx, obj.ID); err != nil {
+				s.log.Error("pay invoice failed", "invoice", obj.ID, "err", err)
 			}
 		}
 		if evt.BillingPeriod.Final {

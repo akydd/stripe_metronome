@@ -79,7 +79,16 @@ type Service struct {
 	byCustomer map[string]string        // customer -> container id (one container/customer)
 	subIdem    map[string]string        // idempotency key -> container id
 	drafts     map[string]*draftInvoice // invoice id -> open draft awaiting finalize
+	open       map[string]*openInvoice  // invoice id -> finalized invoice awaiting payment
 	invoices   map[string][]map[string]any
+}
+
+// openInvoice is a finalized invoice that hasn't been paid yet. With auto_advance
+// off, Stripe doesn't collect on its own after finalization — the integration calls
+// the pay endpoint to attempt collection, which is what this models.
+type openInvoice struct {
+	obj   map[string]any // the invoice object (same pointer held in `invoices` once paid)
+	final bool           // this was a container's final (cancellation) invoice
 }
 
 // draftInvoice is an invoice Stripe has created but not yet finalized. At creation
@@ -140,6 +149,7 @@ func New(log *slog.Logger, webhookURL, webhookSecret string) *Service {
 		byCustomer:    map[string]string{},
 		subIdem:       map[string]string{},
 		drafts:        map[string]*draftInvoice{},
+		open:          map[string]*openInvoice{},
 		invoices:      map[string][]map[string]any{},
 	}
 	go s.advancePeriods()
@@ -206,6 +216,7 @@ func (s *Service) openDraftLocked(st *subState, start, end time.Time, period int
 func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/invoiceitems", s.handleCreateItem)
 	mux.HandleFunc("POST /v1/invoices/{id}/finalize", s.handleFinalizeInvoice)
+	mux.HandleFunc("POST /v1/invoices/{id}/pay", s.handlePayInvoice)
 	mux.HandleFunc("GET /v1/subscription-plan", s.handleSubscriptionPlan)
 	// A subscription is a container with items. POST adds an item (creating the
 	// container if needed); DELETE removes one item by type.
@@ -385,10 +396,10 @@ func (s *Service) handleRemoveItem(w http.ResponseWriter, r *http.Request) {
 
 // handleFinalizeInvoice finalizes an open draft invoice (mirrors Stripe's finalize
 // endpoint). It totals the draft's lines — the subscription fee set at creation plus
-// any usage items attached since — stores the finalized invoice, closes the
-// container if this was its final invoice, and fires invoice.finalized followed by
-// invoice.payment_succeeded or invoice.payment_failed. A demo customer whose id
-// contains "fail" doesn't pay.
+// any usage items attached since — marks the invoice as open (status "open", not yet
+// paid), stores it, closes the container if this was its final invoice, and fires
+// invoice.finalized. With auto_advance off, Stripe does NOT collect on its own after
+// finalization; the integration calls the pay endpoint next (see handlePayInvoice).
 func (s *Service) handleFinalizeInvoice(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -410,34 +421,64 @@ func (s *Service) handleFinalizeInvoice(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	amountDue := int(math.Round(float64(totalMicros) / float64(microsPerCent)))
-	paid := !strings.Contains(strings.ToLower(d.Customer), "fail")
-	status := "paid"
-	if !paid {
-		status = "open"
-	}
 	inv := map[string]any{
 		"id": d.ID, "object": "invoice", "customer": d.Customer, "period": d.Period,
 		"amount_due": amountDue, "amount_due_micros": totalMicros, "currency": currency,
-		"status": status, "paid": paid, "lines": d.Lines,
+		"status": "open", "paid": false, "lines": d.Lines,
 		"created": time.Now().UTC().Format(time.RFC3339),
 	}
+	s.open[d.ID] = &openInvoice{obj: inv, final: d.Final}
 	if amountDue > 0 {
 		s.invoices[d.Customer] = append(s.invoices[d.Customer], inv)
 	}
 	if d.Final {
+		// Cancellation closes the container regardless of whether the final invoice
+		// is paid (as in Stripe: cancellation isn't contingent on collection).
 		delete(s.subs, d.SubscriptionID)
 		delete(s.byCustomer, d.Customer)
 	}
 	s.mu.Unlock()
 
-	s.log.Info("finalized invoice", "id", d.ID, "customer", d.Customer, "amount_due", amountDue, "paid", paid)
+	s.log.Info("finalized invoice", "id", d.ID, "customer", d.Customer, "amount_due", amountDue, "status", "open")
 	writeJSON(w, http.StatusOK, inv)
-
 	s.fireInvoiceEvent("invoice.finalized", inv, d.Final)
+}
+
+// handlePayInvoice attempts collection on a finalized (open) invoice (mirrors
+// Stripe's pay endpoint, used when auto_advance is off). On success it flips the
+// invoice to paid and fires invoice.payment_succeeded; a demo customer whose id
+// contains "fail" doesn't pay — the invoice stays open and invoice.payment_failed
+// fires. The invoice object is shared with the customer-visible list, so its status
+// updates there too.
+func (s *Service) handlePayInvoice(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	s.mu.Lock()
+	oi := s.open[id]
+	if oi == nil {
+		s.mu.Unlock()
+		http.Error(w, "no such open invoice", http.StatusNotFound)
+		return
+	}
+	paid := !strings.Contains(strings.ToLower(oi.obj["customer"].(string)), "fail")
 	if paid {
-		s.fireInvoiceEvent("invoice.payment_succeeded", inv, d.Final)
+		oi.obj["status"] = "paid"
+		oi.obj["paid"] = true
+		delete(s.open, id) // collected; done
 	} else {
-		s.fireInvoiceEvent("invoice.payment_failed", inv, d.Final)
+		oi.obj["status"] = "open"
+		oi.obj["paid"] = false // stays open for a later retry
+	}
+	inv := oi.obj
+	final := oi.final
+	s.mu.Unlock()
+
+	s.log.Info("invoice payment attempted", "id", id, "paid", paid)
+	writeJSON(w, http.StatusOK, inv)
+	if paid {
+		s.fireInvoiceEvent("invoice.payment_succeeded", inv, final)
+	} else {
+		s.fireInvoiceEvent("invoice.payment_failed", inv, final)
 	}
 }
 

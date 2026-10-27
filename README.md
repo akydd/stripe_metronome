@@ -9,6 +9,26 @@ stand-ins (`fakemetronome` / `fakestripe`).
 It's a working demo — single box, in-memory state (see *Production scaling*) — not
 a production system.
 
+## Contents
+
+- [Architecture (components & event flow)](#architecture-components--event-flow)
+- [Services](#services)
+- [Event flow](#event-flow)
+- [Layout](#layout)
+- [Getting started](#getting-started)
+- [Run the full stack (Docker Compose)](#run-the-full-stack-docker-compose)
+  - [Viewing the two UIs locally](#viewing-the-two-uis-locally)
+  - [Watch the billing lifecycle](#watch-the-billing-lifecycle)
+- [Pricing & rounding](#pricing--rounding)
+- [Billing periods & windowed usage](#billing-periods--windowed-usage)
+- [Stripe invoice finalization: `auto_advance` true vs false](#stripe-invoice-finalization-auto_advance-true-vs-false)
+- [Metronome API fidelity](#metronome-api-fidelity)
+- [Deploy to an AWS t4g.small](#deploy-to-an-aws-t4gsmall)
+- [Production scaling](#production-scaling)
+  - [Demo shortcuts that won't scale](#demo-shortcuts-that-wont-scale)
+  - [Path to production (roughly in priority)](#path-to-production-roughly-in-priority)
+  - [Caching the mid-cycle invoice](#caching-the-mid-cycle-invoice)
+
 ## Architecture (components & event flow)
 
 A component-level (≈ C4 Level 3) view, drawn as a sequence so the event-driven
@@ -57,7 +77,9 @@ sequenceDiagram
     MM-->>M: priced usage for the window
     I->>S: POST /v1/invoiceitems {invoice: id} (usage lines)
     I->>S: POST /v1/invoices/{id}/finalize
-    S-->>I: webhook invoice.finalized, then payment_succeeded / failed
+    S-->>I: webhook invoice.finalized (status open)
+    I->>S: POST /v1/invoices/{id}/pay (auto_advance off → collect explicitly)
+    S-->>I: webhook invoice.payment_succeeded / failed
     I->>K: invoice.finalized, payment.succeeded / failed
     K-->>B: payment outcome
 
@@ -82,7 +104,7 @@ billing` for customer validation).
 | Service     | Binary            | Default addr | Responsibility |
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping) and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
-| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP; reacts to Stripe **webhooks** (`POST /webhooks/stripe`): `customer.subscription.created/updated`, `invoice.created`, `invoice.finalized`, `invoice.payment_succeeded/failed`. When Stripe opens a draft invoice at a period boundary, it pulls that window's usage from Metronome, attaches it to the draft as invoice items, and finalizes the invoice (fee + usage), mapping the finalize/payment webhooks onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
+| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP; reacts to Stripe **webhooks** (`POST /webhooks/stripe`): `customer.subscription.created/updated`, `invoice.created`, `invoice.finalized`, `invoice.payment_succeeded/failed`. When Stripe opens a draft invoice at a period boundary, it pulls that window's usage from Metronome, attaches it to the draft as invoice items, finalizes the invoice (fee + usage), then — since `auto_advance` is off — triggers collection via the pay endpoint, mapping the finalize/payment webhooks onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
 | `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Forwards ingested usage to Metronome's `/ingest` (batched) and exposes priced usage via Metronome's **list-costs** — either current unbilled usage (the mid-cycle preview) or an exact `[start, end)` window at a period boundary. **Bill-by-receipt:** it stamps each event's Metronome `timestamp` with *ingestion* time and keeps the true occurrence time in `properties.original_timestamp`, so late/backdated usage rolls into the current cycle instead of a closed one. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs). Usage is stored per-event with its timestamp, so costs can be queried for an **arbitrary window** (`?start=&end=`) — that's what lets a caller bill usage for a period defined by Stripe. Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
@@ -115,7 +137,7 @@ mid-cycle   frontend ─HTTP─▶ invoicing (/v1/customers/{id}/upcoming-invoic
 
 period end  Stripe advances a period (timer), opens a draft ─webhook (invoice.created)─▶ invoicing
 (provider     invoicing ── pull usage for [period_start, period_end) ◀── metering ◀── Metronome
- driven)      invoicing ── attach usage items to the draft, then finalize ─▶ Stripe  (fee + usage)
+ driven)      invoicing ── attach usage to draft, finalize, then pay ─▶ Stripe  (fee + usage)
               Stripe ─webhook (invoice.finalized, payment_succeeded/failed)─▶ invoicing ─▶ [bus] ─▶ billing
 ```
 
@@ -282,7 +304,8 @@ a **final** invoice for the **prorated** partial period + its usage, finalizes i
 then drops the subscription.
 
 **Payment failure branch:** a customer whose id contains `fail` doesn't pay (e.g.
-create one named "Fail Co"), so its invoice ends on `payment.failed`.
+create one named "Fail Co"), so the pay step fails: the invoice finalizes but stays
+`open` (unpaid, available for retry) and the cycle ends on `payment.failed`.
 
 > **Note:** usage is billed by the subscription's period, so a customer with usage
 > but **no** subscription has no billing cycle and won't be invoiced — see
@@ -352,12 +375,13 @@ is treated as a metering store queried for that exact window.
 - At each boundary Stripe opens a **draft** invoice (with the subscription's own
   flat-fee line already on it) and fires **`invoice.created`**. `invoicing` reacts:
   it queries Metronome for usage in `[period_start, period_end)`, attaches those to
-  the draft as invoice items, then calls Stripe's **finalize** — producing **one**
-  invoice = the subscription fee **+** that period's usage, followed by
-  `invoice.finalized` and `invoice.payment_succeeded/failed`. This mirrors the real
-  Stripe `auto_advance:false` flow for adding externally-metered usage to a draft
-  before it finalizes. (The GET upcoming-invoice preview is the separate
-  retrieve-upcoming-invoice API — a read, not the billing trigger.)
+  the draft as invoice items, calls Stripe's **finalize** (→ `invoice.finalized`,
+  status `open`), then — because `auto_advance` is off, so Stripe won't collect on
+  its own — calls **pay** to collect (→ `invoice.payment_succeeded/failed`). The
+  result is **one** invoice = the subscription fee **+** that period's usage. This
+  mirrors the real Stripe `auto_advance:false` flow for adding externally-metered
+  usage to a draft before finalizing and collecting. (The GET upcoming-invoice
+  preview is the separate retrieve-upcoming-invoice API — a read, not the trigger.)
 - Because usage is pulled for an **arbitrary window**, Metronome's own schedule
   never has to align with Stripe's. `fakemetronome` stores each event with its
   timestamp and aggregates over any `[start, end)`; a `billedThrough` watermark
@@ -385,6 +409,46 @@ customer with usage but no subscription has no billing cycle (it wouldn't be
 invoiced); with multiple subscriptions on one customer, the first period to close
 sweeps up the customer's pending usage. A production build would give usage its own
 period authority and tie usage to a specific subscription item.
+
+## Stripe invoice finalization: `auto_advance` true vs false
+
+`auto_advance` is Stripe's autopilot for an invoice's lifecycle. It governs whether
+Stripe drives a draft invoice forward on its own — both **auto-finalizing** the draft
+and **auto-collecting** payment (including the dunning/retry schedule) once it's
+open. The two settings imply very different integration shapes, and the choice turns
+on one question: **does your line-item total exist the moment Stripe creates the
+invoice, or do you still have to add to it?**
+
+**`auto_advance: true` (Stripe drives it)**
+- Stripe finalizes the draft automatically (after a ~1-hour window) and then collects
+  payment and runs retries — you write no finalize/pay calls.
+- Best when the invoice is **complete at creation**: a plain subscription, or usage
+  that Stripe itself meters (metered prices / the Meters API), so nothing external
+  needs attaching.
+- The cost is a **race** for externally-metered usage: you must get your line items
+  onto the draft before Stripe auto-finalizes. The ~1-hour window is usually plenty
+  in production, but it's a window you don't control, and anything that lands after
+  it misses the invoice.
+
+**`auto_advance: false` (you drive it)**
+- Stripe does **nothing** on its own: you call `finalize` when your items are on the
+  draft, and `pay` to collect. You also own retries — Stripe's Smart Retries won't
+  fire.
+- Best when you must **enrich the invoice before it closes** — exactly the
+  Stripe + external-meter (Metronome) case: react to `invoice.created`, attach the
+  period's usage, *then* finalize. No race, because finalization can't happen until
+  you ask for it.
+- The cost is that you now own the progression: nothing finalizes or collects (or
+  retries) unless your service is up and makes the calls. A missed `pay` call means a
+  finalized-but-uncollected invoice sitting `open`.
+
+**What this project does.** It uses **`auto_advance: false`** because attaching
+Metronome usage to the Stripe invoice is a hard requirement, and determinism matters
+for a 30-second demo cycle: `invoicing` reacts to `invoice.created`, attaches the
+window's usage, calls `finalize`, then calls `pay`. The trade-off accepted is
+owning the finalize/pay/retry progression ourselves rather than letting Stripe's
+autopilot run it. (A failed charge — the `fail` customer — leaves the invoice `open`
+for a later retry, which in a real `auto_advance:false` build you would schedule.)
 
 ## Metronome API fidelity
 
