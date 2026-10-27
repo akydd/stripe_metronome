@@ -168,10 +168,11 @@ export async function deleteGenerator(id: string): Promise<void> {
   }
 }
 
-// emitUsage fires a burst of usage events on demand (independent of the tick loop),
-// timestamped now.
-export async function emitUsage(id: string, count = 1): Promise<void> {
-  const res = await fetch(`${BASE}/${id}/emit?count=${count}`, { method: 'POST' })
+// emitUsage fires a burst of usage events on demand (independent of the tick loop).
+// With late=true the occurrence time is backdated to simulate a late arrival — it
+// still bills in the current cycle, with the original time preserved.
+export async function emitUsage(id: string, count = 1, late = false): Promise<void> {
+  const res = await fetch(`${BASE}/${id}/emit?count=${count}&late=${late}`, { method: 'POST' })
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`)
   }

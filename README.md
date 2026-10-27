@@ -82,7 +82,7 @@ billing` for customer validation).
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping) and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
 | `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP; reacts to Stripe **webhooks** (`POST /webhooks/stripe`): `customer.subscription.created` and `invoice.upcoming`. At each subscription's period boundary it pulls that window's usage from Metronome, pushes it to Stripe as invoice items, and finalizes one invoice (fee + usage), mapping the outcome onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
-| `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Ingests usage, determines lateness, and reads mid-period priced usage from Metronome's **list-costs** endpoint. Calls `METRONOME_BASE_URL`. |
+| `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Forwards ingested usage to Metronome's `/ingest` (batched) and exposes priced usage via Metronome's **list-costs** — either current unbilled usage (the mid-cycle preview) or an exact `[start, end)` window at a period boundary. **Bill-by-receipt:** it stamps each event's Metronome `timestamp` with *ingestion* time and keeps the true occurrence time in `properties.original_timestamp`, so late/backdated usage rolls into the current cycle instead of a closed one. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs). Usage is stored per-event with its timestamp, so costs can be queried for an **arbitrary window** (`?start=&end=`) — that's what lets a caller bill usage for a period defined by Stripe. Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
 | `controlplane` | `cmd/controlplane` | `:8085`  | Control plane for **usage generator** processes (`/v1/generators`): they tick and publish `usage.ingested`. Also relays **subscription item** add/remove (`/v1/subscriptions`, `/v1/subscriptions/remove-item`) to the invoicing service (which owns the subscription container). Frontend calls it directly. |
@@ -361,12 +361,23 @@ usage 10 days in. At the subscription's month end, the invoice carries the flat 
 **and** the 10-days-in-to-month-end usage — one invoice, because the subscription
 period defined the window and usage was pulled for exactly it.
 
+**Late-arriving usage (bill-by-receipt).** Rather than modelling Metronome's grace
+window, the demo takes a simpler, explicit stance: a late event is billed in the
+cycle it is *received*, not the one it *occurred* in. `metering` implements this in
+our integration layer — it sends Metronome the **ingestion** time as the event
+`timestamp` (which is what Metronome files the event by) and preserves the real
+occurrence time in `properties.original_timestamp` so the information isn't lost.
+A backdated event therefore lands in the current open period instead of a
+finalized past one. You can watch this in the UI: **Emit late** on a usage
+generator fires a burst stamped 10 minutes in the past, and it still shows up on
+the current period's invoice. (This is a policy choice; a production build might
+instead reopen a prior period within a grace window, which real Metronome supports.)
+
 Known simplifications: usage is billed **by the subscription's period**, so a
 customer with usage but no subscription has no billing cycle (it wouldn't be
 invoiced); with multiple subscriptions on one customer, the first period to close
 sweeps up the customer's pending usage. A production build would give usage its own
-period authority and tie usage to a specific subscription item. The demo also does
-not model Metronome's grace window for late-arriving events.
+period authority and tie usage to a specific subscription item.
 
 ## Metronome API fidelity
 

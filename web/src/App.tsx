@@ -718,6 +718,13 @@ export function App() {
                     >
                       Emit usage
                     </button>
+                    <button
+                      className="btn btn-outline-warning"
+                      title="Emit backdated (late) usage — still bills in the current cycle"
+                      onClick={() => run(() => emitUsage(p.id, 10, true))}
+                    >
+                      Emit late
+                    </button>
                     <button className="btn btn-outline-danger" onClick={() => run(() => deleteGenerator(p.id))}>
                       Delete
                     </button>

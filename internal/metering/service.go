@@ -89,17 +89,25 @@ func (s *Service) onUsageIngested(ctx context.Context, e events.Event) error {
 		p.Quantity = 1
 	}
 
-	// transaction_id == event ID makes retries idempotent. The event carries its
-	// occurrence timestamp so Metronome can assign it to the right billing window.
-	// generator_id is a dimension the billable metric groups by (per generator).
+	// transaction_id == event ID makes retries idempotent. generator_id is a
+	// dimension the billable metric groups by (per generator).
+	//
+	// Bill-by-receipt policy: Metronome assigns an event to a billing period by its
+	// `timestamp`, so we stamp it with INGESTION time (now). That way late/backdated
+	// usage files into the period it was received — i.e. it rolls into the current
+	// cycle — rather than into an already-finalized past period (where it'd be lost).
+	// The true occurrence time isn't lost: it's preserved in properties as
+	// `original_timestamp`. (This policy lives here, in our integration layer, not in
+	// Metronome — Metronome just files by whatever `timestamp` we send.)
 	ev := ingestEvent{
 		TransactionID: e.ID,
 		CustomerID:    e.CustomerID,
-		Timestamp:     e.OccurredAt.Format(time.RFC3339),
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
 		EventType:     p.EventType,
 		Properties: map[string]any{
-			"quantity":     p.Quantity,
-			"generator_id": p.GeneratorID,
+			"quantity":           p.Quantity,
+			"generator_id":       p.GeneratorID,
+			"original_timestamp": e.OccurredAt.Format(time.RFC3339),
 		},
 	}
 	s.bufMu.Lock()

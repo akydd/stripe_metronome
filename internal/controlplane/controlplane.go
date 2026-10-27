@@ -361,9 +361,11 @@ func (m *Manager) emitBatch(ctx context.Context, id, customer string, n int, occ
 	m.mu.Unlock()
 }
 
-// handleEmit fires one or more usage events on demand (?count=N), timestamped now,
-// independent of the tick loop and regardless of whether the process is running —
-// a quick way to generate a burst of usage in the current period.
+// handleEmit fires one or more usage events on demand (?count=N), independent of
+// the tick loop and regardless of whether the process is running. With ?late=true
+// it backdates the occurrence time to simulate a late-arriving event — metering
+// still bills it in the current cycle (by ingestion time) but preserves this
+// original timestamp, so you can see late usage roll into the current invoice.
 func (m *Manager) handleEmit(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	m.mu.Lock()
@@ -391,6 +393,9 @@ func (m *Manager) handleEmit(w http.ResponseWriter, r *http.Request) {
 		count = 5000
 	}
 	occurredAt := time.Now().UTC()
+	if r.URL.Query().Get("late") == "true" {
+		occurredAt = occurredAt.Add(-10 * time.Minute) // simulate a late (backdated) arrival
+	}
 	m.emitBatch(r.Context(), id, cust, count, occurredAt)
 	writeJSON(w, http.StatusOK, map[string]any{"process": id, "emitted": count, "occurred_at": occurredAt})
 }
