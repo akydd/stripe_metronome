@@ -75,11 +75,27 @@ type Service struct {
 
 	mu         sync.Mutex
 	seq        int
-	items      map[string][]line    // customer -> pending invoice items (usage)
-	subs       map[string]*subState // container id -> container
-	byCustomer map[string]string    // customer -> container id (one container/customer)
-	subIdem    map[string]string    // idempotency key -> container id
+	subs       map[string]*subState     // container id -> container
+	byCustomer map[string]string        // customer -> container id (one container/customer)
+	subIdem    map[string]string        // idempotency key -> container id
+	drafts     map[string]*draftInvoice // invoice id -> open draft awaiting finalize
 	invoices   map[string][]map[string]any
+}
+
+// draftInvoice is an invoice Stripe has created but not yet finalized. At creation
+// it already carries the subscription's own lines (flat fee + any proration); the
+// integration attaches metered usage items to it during the finalization window,
+// then finalizes it. Mirrors a real Stripe draft invoice (auto_advance=false).
+type draftInvoice struct {
+	ID             string
+	Customer       string
+	SubscriptionID string
+	Period         int
+	PeriodStart    time.Time
+	PeriodEnd      time.Time
+	Final          bool // closes the container when finalized
+	BillUsage      bool // whether the integration should attach usage to this draft
+	Lines          []line
 }
 
 // subState is a subscription container: a billing period plus a set of items.
@@ -120,35 +136,27 @@ func New(log *slog.Logger, webhookURL, webhookSecret string) *Service {
 		http:          &http.Client{Timeout: 10 * time.Second},
 		webhookURL:    webhookURL,
 		webhookSecret: webhookSecret,
-		items:         map[string][]line{},
 		subs:          map[string]*subState{},
 		byCustomer:    map[string]string{},
 		subIdem:       map[string]string{},
+		drafts:        map[string]*draftInvoice{},
 		invoices:      map[string][]map[string]any{},
 	}
 	go s.advancePeriods()
 	return s
 }
 
-// billTrigger is a container period that just ended and needs finalizing.
-type billTrigger struct {
-	obj       map[string]any
-	start     time.Time
-	end       time.Time
-	period    int
-	billUsage bool
-}
-
 // advancePeriods rolls each container onto its next billing period when the current
-// one elapses and fires an invoice.upcoming webhook for the period that just ended
-// — the signal for invoicing to finalize the combined invoice (flat fee + usage).
-// Containers with no items are skipped (they're awaiting their final invoice).
+// one elapses and, for the period that just ended, opens a draft invoice and fires
+// an invoice.created webhook — the real-Stripe signal that an invoice now exists and
+// is open for line items before it finalizes. Containers with no items are skipped
+// (they're awaiting their final invoice from cancellation).
 func (s *Service) advancePeriods() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for now := range t.C {
 		now = now.UTC()
-		var triggers []billTrigger
+		var opened []*draftInvoice
 		s.mu.Lock()
 		for _, st := range s.subs {
 			if len(st.Items) == 0 {
@@ -160,20 +168,44 @@ func (s *Service) advancePeriods() {
 				st.PeriodEnd = st.PeriodStart.Add(subscriptionPeriod)
 				st.Period++
 				s.log.Info("subscription period ended", "id", st.ID, "period", endedPeriod, "items", len(st.Items))
-				triggers = append(triggers, billTrigger{obj: subObject(st), start: endedStart, end: endedEnd, period: endedPeriod, billUsage: st.has(itemUsage)})
+				opened = append(opened, s.openDraftLocked(st, endedStart, endedEnd, endedPeriod, false, st.has(itemUsage)))
 			}
 		}
 		s.mu.Unlock()
-		for _, tr := range triggers {
-			s.fireUpcoming(tr.obj, tr.start, tr.end, tr.period, false, tr.billUsage)
+		for _, d := range opened {
+			s.fireInvoiceCreated(d)
 		}
 	}
+}
+
+// openDraftLocked creates a draft invoice for a container's billing window, already
+// populated with the subscription's own lines (flat-fee item for [start, end), plus
+// any proration owed from a flat-fee item removed mid-period). Metered usage is
+// attached later, before finalize. Caller must hold s.mu.
+func (s *Service) openDraftLocked(st *subState, start, end time.Time, period int, final, billUsage bool) *draftInvoice {
+	var lines []line
+	if fi := st.Items[itemFlatFee]; fi != nil {
+		if cents := flatFeeForWindow(fi.AddedAt, start, end); cents > 0 {
+			lines = append(lines, s.subLine(st.Customer, cents, "Flat-fee Subscription"))
+		}
+	}
+	if st.PendingProrationCents > 0 {
+		lines = append(lines, s.subLine(st.Customer, st.PendingProrationCents, "Flat-fee Subscription (proration)"))
+		st.PendingProrationCents = 0
+	}
+	d := &draftInvoice{
+		ID: s.nextID("in"), Customer: st.Customer, SubscriptionID: st.ID,
+		Period: period, PeriodStart: start, PeriodEnd: end, Final: final, BillUsage: billUsage,
+		Lines: lines,
+	}
+	s.drafts[d.ID] = d
+	return d
 }
 
 // Register wires the fake's HTTP routes.
 func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/invoiceitems", s.handleCreateItem)
-	mux.HandleFunc("POST /v1/invoices", s.handleCreateInvoice)
+	mux.HandleFunc("POST /v1/invoices/{id}/finalize", s.handleFinalizeInvoice)
 	mux.HandleFunc("GET /v1/subscription-plan", s.handleSubscriptionPlan)
 	// A subscription is a container with items. POST adds an item (creating the
 	// container if needed); DELETE removes one item by type.
@@ -194,9 +226,12 @@ func randID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(b[:])
 }
 
-// handleCreateItem adds a pending invoice item (metered usage) to the customer.
+// handleCreateItem adds an invoice item (metered usage) to an open draft invoice,
+// identified by the `invoice` field — like a real Stripe invoice item scoped to a
+// specific draft. The item appears on that invoice when it finalizes.
 func (s *Service) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		Invoice         string  `json:"invoice"`
 		Customer        string  `json:"customer"`
 		AmountMicros    int64   `json:"amount_micros"`
 		Currency        string  `json:"currency"`
@@ -212,11 +247,17 @@ func (s *Service) handleCreateItem(w http.ResponseWriter, r *http.Request) {
 		req.Currency = "usd"
 	}
 	s.mu.Lock()
+	d := s.drafts[req.Invoice]
+	if d == nil {
+		s.mu.Unlock()
+		http.Error(w, "no such open invoice", http.StatusNotFound)
+		return
+	}
 	item := line{
 		ID: s.nextID("ii"), Customer: req.Customer, AmountMicros: req.AmountMicros,
 		Currency: req.Currency, Description: req.Description, Quantity: req.Quantity, UnitPriceMicros: req.UnitPriceMicros,
 	}
-	s.items[req.Customer] = append(s.items[req.Customer], item)
+	d.Lines = append(d.Lines, item)
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, item)
 }
@@ -298,8 +339,8 @@ func (s *Service) handleAddItem(w http.ResponseWriter, r *http.Request) {
 // handleRemoveItem removes one item from a container. Removing the flat-fee item
 // stashes its prorated partial-period charge to bill on the next combined invoice,
 // and the container keeps running if a usage item remains. Removing the last item
-// ends the subscription: a final invoice.upcoming bills the closing amount, then
-// the container is dropped.
+// ends the subscription: a final invoice is opened for the closing amount, and the
+// container is dropped when that invoice finalizes.
 func (s *Service) handleRemoveItem(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	itemType := r.PathValue("type")
@@ -325,90 +366,79 @@ func (s *Service) handleRemoveItem(w http.ResponseWriter, r *http.Request) {
 	delete(st.Items, itemType)
 	empty := len(st.Items) == 0
 	obj := subObject(st)
-	start, period := st.PeriodStart, st.Period
+	var finalDraft *draftInvoice
+	if empty {
+		// End the subscription: open a final invoice for the partial period. Bill
+		// usage only if the item just removed was the usage item (otherwise none).
+		finalDraft = s.openDraftLocked(st, st.PeriodStart, now, st.Period, true, itemType == itemUsage)
+	}
 	s.mu.Unlock()
 
 	s.log.Info("subscription item removed", "id", id, "item", itemType, "container_empty", empty)
-	if empty {
-		// End the subscription: final invoice for the partial period. Bill usage
-		// only if the item just removed was the usage item (otherwise there's none).
-		s.fireUpcoming(obj, start, now, period, true, itemType == itemUsage)
+	if finalDraft != nil {
+		s.fireInvoiceCreated(finalDraft)
 	} else {
 		s.fireWebhook("customer.subscription.updated", obj)
 	}
 	writeJSON(w, http.StatusOK, obj)
 }
 
-// handleCreateInvoice finalizes ONE container's combined invoice for a billing
-// period: the flat-fee item (full or prorated by its AddedAt), any pending flat-fee
-// proration from a removed item, plus the customer's pending invoice items (that
-// period's usage, pushed by invoicing beforehand). `final` ends the container.
-func (s *Service) handleCreateInvoice(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Customer       string `json:"customer"`
-		SubscriptionID string `json:"subscription_id"`
-		Period         int    `json:"period"`
-		PeriodStart    string `json:"period_start"`
-		PeriodEnd      string `json:"period_end"`
-		Final          bool   `json:"final"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	pStart, _ := time.Parse(time.RFC3339, req.PeriodStart)
-	pEnd, _ := time.Parse(time.RFC3339, req.PeriodEnd)
+// handleFinalizeInvoice finalizes an open draft invoice (mirrors Stripe's finalize
+// endpoint). It totals the draft's lines — the subscription fee set at creation plus
+// any usage items attached since — stores the finalized invoice, closes the
+// container if this was its final invoice, and fires invoice.finalized followed by
+// invoice.payment_succeeded or invoice.payment_failed. A demo customer whose id
+// contains "fail" doesn't pay.
+func (s *Service) handleFinalizeInvoice(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 
 	s.mu.Lock()
-	lines := s.items[req.Customer]
-	delete(s.items, req.Customer) // usage items are one-shot
-	if st := s.subs[req.SubscriptionID]; st != nil {
-		// Flat-fee item for this period (full, or prorated by when it was added).
-		if fi := st.Items[itemFlatFee]; fi != nil {
-			cents := flatFeeForWindow(fi.AddedAt, pStart, pEnd)
-			lines = append(lines, s.subLine(req.Customer, cents, "Flat-fee Subscription"))
-		}
-		// Proration owed from a flat-fee item removed mid-period.
-		if st.PendingProrationCents > 0 {
-			lines = append(lines, s.subLine(req.Customer, st.PendingProrationCents, "Flat-fee Subscription (proration)"))
-			st.PendingProrationCents = 0
-		}
-		if req.Final {
-			delete(s.subs, st.ID)
-			delete(s.byCustomer, st.Customer)
-		}
+	d := s.drafts[id]
+	if d == nil {
+		s.mu.Unlock()
+		http.Error(w, "no such open invoice", http.StatusNotFound)
+		return
 	}
-	id := s.nextID("in")
-	s.mu.Unlock()
+	delete(s.drafts, id)
 
 	var totalMicros int64
 	currency := "usd"
-	for _, l := range lines {
+	for _, l := range d.Lines {
 		totalMicros += l.AmountMicros
 		if l.Currency != "" {
 			currency = l.Currency
 		}
 	}
 	amountDue := int(math.Round(float64(totalMicros) / float64(microsPerCent)))
-
-	paid := !strings.Contains(strings.ToLower(req.Customer), "fail")
+	paid := !strings.Contains(strings.ToLower(d.Customer), "fail")
 	status := "paid"
 	if !paid {
 		status = "open"
 	}
 	inv := map[string]any{
-		"id": id, "object": "invoice", "customer": req.Customer, "period": req.Period,
+		"id": d.ID, "object": "invoice", "customer": d.Customer, "period": d.Period,
 		"amount_due": amountDue, "amount_due_micros": totalMicros, "currency": currency,
-		"status": status, "paid": paid, "lines": lines,
+		"status": status, "paid": paid, "lines": d.Lines,
 		"created": time.Now().UTC().Format(time.RFC3339),
 	}
 	if amountDue > 0 {
-		s.mu.Lock()
-		s.invoices[req.Customer] = append(s.invoices[req.Customer], inv)
-		s.mu.Unlock()
+		s.invoices[d.Customer] = append(s.invoices[d.Customer], inv)
 	}
-	s.log.Info("created invoice", "id", id, "customer", req.Customer, "amount_due", amountDue, "paid", paid)
+	if d.Final {
+		delete(s.subs, d.SubscriptionID)
+		delete(s.byCustomer, d.Customer)
+	}
+	s.mu.Unlock()
+
+	s.log.Info("finalized invoice", "id", d.ID, "customer", d.Customer, "amount_due", amountDue, "paid", paid)
 	writeJSON(w, http.StatusOK, inv)
+
+	s.fireInvoiceEvent("invoice.finalized", inv, d.Final)
+	if paid {
+		s.fireInvoiceEvent("invoice.payment_succeeded", inv, d.Final)
+	} else {
+		s.fireInvoiceEvent("invoice.payment_failed", inv, d.Final)
+	}
 }
 
 // subLine builds a subscription fee line. Caller must hold s.mu.
@@ -497,18 +527,32 @@ func (s *Service) fireWebhook(eventType string, object map[string]any) {
 	})
 }
 
-// fireUpcoming delivers an invoice.upcoming event: the signal to finalize a
-// container's invoice for a just-ended (or, when final, partial) period. billUsage
-// tells the receiver whether to pull and bill the window's usage.
-func (s *Service) fireUpcoming(object map[string]any, start, end time.Time, period int, final, billUsage bool) {
+// fireInvoiceCreated delivers an invoice.created event: a draft invoice now exists
+// for a just-ended (or, when final, partial) period and is open for line items. The
+// billing_period block tells the receiver the window to pull usage for, whether to
+// bill usage at all, and whether this is the container's final invoice.
+func (s *Service) fireInvoiceCreated(d *draftInvoice) {
 	s.deliver(map[string]any{
-		"id": randID("evt"), "object": "event", "type": "invoice.upcoming",
+		"id": randID("evt"), "object": "event", "type": "invoice.created",
 		"created": time.Now().UTC().Format(time.RFC3339),
-		"data":    map[string]any{"object": object},
+		"data": map[string]any{"object": map[string]any{
+			"id": d.ID, "object": "invoice", "customer": d.Customer, "status": "draft", "period": d.Period,
+		}},
 		"billing_period": map[string]any{
-			"start": start.Format(time.RFC3339), "end": end.Format(time.RFC3339),
-			"period": period, "final": final, "bill_usage": billUsage,
+			"start": d.PeriodStart.Format(time.RFC3339), "end": d.PeriodEnd.Format(time.RFC3339),
+			"period": d.Period, "final": d.Final, "bill_usage": d.BillUsage,
 		},
+	})
+}
+
+// fireInvoiceEvent delivers a finalized-invoice lifecycle event (invoice.finalized,
+// invoice.payment_succeeded, invoice.payment_failed) carrying the invoice object.
+func (s *Service) fireInvoiceEvent(eventType string, inv map[string]any, final bool) {
+	s.deliver(map[string]any{
+		"id": randID("evt"), "object": "event", "type": eventType,
+		"created":        time.Now().UTC().Format(time.RFC3339),
+		"data":           map[string]any{"object": inv},
+		"billing_period": map[string]any{"final": final},
 	})
 }
 

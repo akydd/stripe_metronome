@@ -48,15 +48,16 @@ sequenceDiagram
     K-->>M: deliver usage.ingested
     M->>MM: POST /ingest (batched, per-event timestamps)
 
-    Note over S,B: 3 — Billing cycle — Stripe's timer → webhook → one combined invoice
+    Note over S,B: 3 — Billing cycle — Stripe's timer → draft → attach usage → finalize
     S->>S: subscription period (30s) ends
-    S-->>I: webhook invoice.upcoming {period window, bill_usage}
+    S->>S: open draft invoice (flat-fee line added)
+    S-->>I: webhook invoice.created {invoice id, period window, bill_usage}
     I->>M: GET /usage?start&end&finalize (exact window)
     M->>MM: GET /costs?start&end
     MM-->>M: priced usage for the window
-    I->>S: POST /v1/invoiceitems (usage lines)
-    I->>S: POST /v1/invoices (finalize: flat fee + usage)
-    S-->>I: one combined invoice (paid / open)
+    I->>S: POST /v1/invoiceitems {invoice: id} (usage lines)
+    I->>S: POST /v1/invoices/{id}/finalize
+    S-->>I: webhook invoice.finalized, then payment_succeeded / failed
     I->>K: invoice.finalized, payment.succeeded / failed
     K-->>B: payment outcome
 
@@ -81,7 +82,7 @@ billing` for customer validation).
 | Service     | Binary            | Default addr | Responsibility |
 |-------------|-------------------|--------------|----------------|
 | `billing`   | `cmd/billing`     | `:8080`      | Business/orchestration. Owns the **customer registry** (`/v1/customers` — unique customers + provider-id mapping) and payment tracking. Not in the usage-data path; does not manage generators; does **not** assemble invoices. |
-| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP; reacts to Stripe **webhooks** (`POST /webhooks/stripe`): `customer.subscription.created` and `invoice.upcoming`. At each subscription's period boundary it pulls that window's usage from Metronome, pushes it to Stripe as invoice items, and finalizes one invoice (fee + usage), mapping the outcome onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
+| `invoicing` | `cmd/invoicing`   | `:8081`      | The Stripe integration. Owns the invoice **and the flat-fee subscription link record** (its id ↔ Stripe subscription id ↔ customer). Creates/cancels subscriptions in Stripe over HTTP; reacts to Stripe **webhooks** (`POST /webhooks/stripe`): `customer.subscription.created/updated`, `invoice.created`, `invoice.finalized`, `invoice.payment_succeeded/failed`. When Stripe opens a draft invoice at a period boundary, it pulls that window's usage from Metronome, attaches it to the draft as invoice items, and finalizes the invoice (fee + usage), mapping the finalize/payment webhooks onto the bus. Calls `STRIPE_BASE_URL` + `METERING_SERVICE_URL`. |
 | `metering` | `cmd/metering`   | `:8082`      | Metering only (invoicing disabled). Forwards ingested usage to Metronome's `/ingest` (batched) and exposes priced usage via Metronome's **list-costs** — either current unbilled usage (the mid-cycle preview) or an exact `[start, end)` window at a period boundary. **Bill-by-receipt:** it stamps each event's Metronome `timestamp` with *ingestion* time and keeps the true occurrence time in `properties.original_timestamp`, so late/backdated usage rolls into the current cycle instead of a closed one. Calls `METRONOME_BASE_URL`. |
 | `fakemetronome` | `cmd/fakemetronome` | `:8083`  | Local stand-in for the Metronome API: `POST /ingest` (dedup + batching) and `GET /v1/customers/{id}/costs` (list-costs). Usage is stored per-event with its timestamp, so costs can be queried for an **arbitrary window** (`?start=&end=`) — that's what lets a caller bill usage for a period defined by Stripe. Swap via `METRONOME_BASE_URL`. |
 | `fakestripe` | `cmd/fakestripe`     | `:8084`  | Local stand-in for the Stripe API (invoice items, invoice create/finalize, payment outcome). Swap for real Stripe test mode via `STRIPE_BASE_URL`. |
@@ -112,17 +113,18 @@ mid-cycle   frontend ─HTTP─▶ invoicing (/v1/customers/{id}/upcoming-invoic
 (read)                        ├─ usage (since last finalize) ◀── metering ◀── Metronome
                               └─ subscriptions ◀── Stripe
 
-period end  Stripe advances a subscription's period (timer) ─webhook (invoice.upcoming)─▶ invoicing
+period end  Stripe advances a period (timer), opens a draft ─webhook (invoice.created)─▶ invoicing
 (provider     invoicing ── pull usage for [period_start, period_end) ◀── metering ◀── Metronome
- driven)      invoicing ── push usage items, then finalize ─▶ Stripe   (invoice = fee + usage)
-              invoicing ─invoice.finalized, payment.succeeded/failed─▶ [bus] ─▶ billing
+ driven)      invoicing ── attach usage items to the draft, then finalize ─▶ Stripe  (fee + usage)
+              Stripe ─webhook (invoice.finalized, payment_succeeded/failed)─▶ invoicing ─▶ [bus] ─▶ billing
 ```
 
 Notes:
 - **The provider owns the billing cycle.** There is no manual "close": each Stripe
-  subscription has its own period (30s in the demo); when it ends, Stripe fires an
-  `invoice.upcoming` webhook and `invoicing` finalizes one invoice = the flat fee
-  **+** that period's usage. See *Billing periods & windowed usage*.
+  subscription has its own period (30s in the demo); when it ends, Stripe opens a
+  draft invoice (`invoice.created`), `invoicing` attaches that period's usage and
+  finalizes it, and the invoice = the flat fee **+** that period's usage. See
+  *Billing periods & windowed usage*.
 - **Usage is billed for an exact window.** `invoicing` queries Metronome for
   `[period_start, period_end)`, so Metronome's own schedule need not match Stripe's.
 
@@ -262,9 +264,9 @@ curl -s http://localhost/v1/customers/$CUST/subscriptions | jq .   # one record:
 ```
 
 **5. Wait for the period to end — no manual step.** When the subscription's 30s
-period elapses, Stripe fires `invoice.upcoming`; `invoicing` pulls that window's
-usage from Metronome, pushes it to Stripe as invoice items, and Stripe finalizes
-**one** invoice = the flat fee **+** the period's usage:
+period elapses, Stripe opens a draft invoice and fires `invoice.created`; `invoicing`
+pulls that window's usage from Metronome, attaches it to the draft as invoice items,
+and finalizes it — **one** invoice = the flat fee **+** the period's usage:
 
 ```sh
 curl -s http://localhost/v1/customers/$CUST/invoices | jq '.[0].lines'
@@ -274,9 +276,10 @@ curl -s http://localhost/v1/customers/$CUST/invoices | jq '.[0].lines'
 
 Watch the chain light up in the **Live events** panel: `invoice.finalized →
 payment.succeeded`, unprompted. Metering + pricing (`fakemetronome`) and the
-invoice (`fakestripe`) are real; only the provider APIs are stubbed. Cancelling a
-subscription (`POST /v1/subscriptions/{id}/cancel`) fires a final `invoice.upcoming`
-that bills the **prorated** partial period + its usage, then drops the subscription.
+invoice (`fakestripe`) are real; only the provider APIs are stubbed. Removing the
+last item (`POST /v1/subscriptions/remove-item`) ends the subscription: Stripe opens
+a **final** invoice for the **prorated** partial period + its usage, finalizes it,
+then drops the subscription.
 
 **Payment failure branch:** a customer whose id contains `fail` doesn't pay (e.g.
 create one named "Fail Co"), so its invoice ends on `payment.failed`.
@@ -346,11 +349,15 @@ is treated as a metering store queried for that exact window.
 - Each Stripe subscription (`fakestripe`) has its own period — **30 seconds** in
   the demo, anchored at creation (compressed so a cycle is watchable). Stripe rolls
   it forward like `current_period_end`.
-- At each boundary Stripe fires an **`invoice.upcoming`** webhook. `invoicing`
-  reacts: it queries Metronome for usage in `[period_start, period_end)`, pushes
-  those as invoice items, and Stripe finalizes **one** invoice = the subscription
-  fee **+** that period's usage. This mirrors how you'd add externally-metered
-  usage to a Stripe subscription invoice before it finalizes.
+- At each boundary Stripe opens a **draft** invoice (with the subscription's own
+  flat-fee line already on it) and fires **`invoice.created`**. `invoicing` reacts:
+  it queries Metronome for usage in `[period_start, period_end)`, attaches those to
+  the draft as invoice items, then calls Stripe's **finalize** — producing **one**
+  invoice = the subscription fee **+** that period's usage, followed by
+  `invoice.finalized` and `invoice.payment_succeeded/failed`. This mirrors the real
+  Stripe `auto_advance:false` flow for adding externally-metered usage to a draft
+  before it finalizes. (The GET upcoming-invoice preview is the separate
+  retrieve-upcoming-invoice API — a read, not the billing trigger.)
 - Because usage is pulled for an **arbitrary window**, Metronome's own schedule
   never has to align with Stripe's. `fakemetronome` stores each event with its
   timestamp and aggregates over any `[start, end)`; a `billedThrough` watermark

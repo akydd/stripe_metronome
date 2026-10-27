@@ -1,7 +1,8 @@
 // Package invoicing implements the invoicing integration with Stripe. Stripe owns
-// the invoice: at the end of a billing cycle (billing_cycle.ended) this service
-// queries Metronome for the period's usage + price, creates the invoice items and
-// invoice in Stripe, and maps the payment outcome back onto the bus. It talks to
+// the invoice: when Stripe opens a draft invoice at a subscription period boundary
+// (the invoice.created webhook), this service queries Metronome for that period's
+// usage + price, attaches it to the draft as invoice items, and finalizes the
+// invoice — then maps the finalize/payment webhooks back onto the bus. It talks to
 // STRIPE_BASE_URL (fakestripe by default, or real Stripe test mode) and to the
 // metronome service at METRONOME_SERVICE_URL.
 package invoicing
@@ -368,15 +369,16 @@ func (s *Service) createStripeItem(ctx context.Context, customerID, invoicingSub
 	return obj.ID, nil
 }
 
-// finalizeSubscriptionInvoice bills one subscription's billing period: it pulls
-// that period's usage from Metronome for the exact window (so Metronome's own
-// schedule need not match Stripe's), pushes it to Stripe as invoice items, then
-// finalizes ONE invoice = the subscription fee + those usage items. The provider
-// outcome is mapped onto the bus. `final` marks a cancellation's prorated closer.
-func (s *Service) finalizeSubscriptionInvoice(ctx context.Context, customerID, stripeSubID string, periodStart, periodEnd time.Time, period int, final, billUsage bool) error {
-	// 1. If the container bills usage, pull this period's usage from Metronome for
-	//    the exact [start, end) window; finalize=true advances Metronome's watermark.
+// billOpenInvoice reacts to a draft invoice Stripe just opened for a billing period:
+// it pulls that period's usage from Metronome for the exact window (so Metronome's
+// own schedule need not match Stripe's), attaches it to the draft as invoice items,
+// then finalizes the invoice. Finalization triggers invoice.finalized and a payment
+// webhook from Stripe, where the bus facts are published. `billUsage` is false for a
+// flat-fee-only period (nothing to pull).
+func (s *Service) billOpenInvoice(ctx context.Context, customerID, invoiceID string, periodStart, periodEnd time.Time, period int, billUsage bool) error {
 	if billUsage {
+		// Pull this period's usage for the exact [start, end) window; finalize=true
+		// advances Metronome's watermark so the same usage isn't billed twice.
 		q := url.Values{}
 		q.Set("start", periodStart.Format(time.RFC3339))
 		q.Set("end", periodEnd.Format(time.RFC3339))
@@ -392,75 +394,47 @@ func (s *Service) finalizeSubscriptionInvoice(ctx context.Context, customerID, s
 		if currency == "" {
 			currency = "usd"
 		}
-		// 2. Push the period's usage to Stripe as pending invoice items.
 		for _, g := range usage.Groups {
 			if g.UsageMicros <= 0 {
 				continue
 			}
 			desc := usageDesc(g.Dimensions, period)
-			if err := s.addInvoiceItem(ctx, customerID, g.UsageMicros, currency, desc, g.Quantity, g.UnitPriceMicros); err != nil {
+			if err := s.addInvoiceItem(ctx, invoiceID, customerID, g.UsageMicros, currency, desc, g.Quantity, g.UnitPriceMicros); err != nil {
 				return err
 			}
 		}
 	}
 
-	// 3. Finalize ONE combined invoice for the container: flat fee (computed by
-	//    Stripe from its items + the period window) + the pushed usage items.
-	var inv struct {
-		ID        string `json:"id"`
-		AmountDue int    `json:"amount_due"`
-		Paid      bool   `json:"paid"`
-		Status    string `json:"status"`
+	// Finalize the draft (Stripe's auto_advance=false flow): the subscription fee was
+	// set on it at creation, and the usage items were just attached.
+	if err := s.postJSON(ctx, s.baseURL+"/v1/invoices/"+invoiceID+"/finalize", nil, nil); err != nil {
+		return fmt.Errorf("finalize invoice %s: %w", invoiceID, err)
 	}
-	if err := s.postJSON(ctx, s.baseURL+"/v1/invoices", map[string]any{
-		"customer":        customerID,
-		"subscription_id": stripeSubID,
-		"period":          period,
-		"period_start":    periodStart.Format(time.RFC3339),
-		"period_end":      periodEnd.Format(time.RFC3339),
-		"final":           final,
-	}, &inv); err != nil {
-		return fmt.Errorf("create invoice: %w", err)
-	}
-	if inv.AmountDue <= 0 {
-		s.log.Info("nothing to bill for period; skipping invoice", "customer", customerID, "period", period)
-		return nil
-	}
-	s.log.Info("stripe invoice finalized", "id", inv.ID, "customer", customerID,
-		"period", period, "amount_cents", inv.AmountDue, "paid", inv.Paid)
+	return nil
+}
 
-	// 4. Map the provider outcome onto domain events.
+// publishInvoiceFact maps a finalized-invoice webhook onto a domain event on the bus.
+func (s *Service) publishInvoiceFact(ctx context.Context, t events.Type, customerID, invoiceID, status string, amountCents int) error {
 	payload, _ := json.Marshal(map[string]any{
-		"invoice_id":   inv.ID,
-		"status":       inv.Status,
-		"amount_cents": inv.AmountDue,
+		"invoice_id":   invoiceID,
+		"status":       status,
+		"amount_cents": amountCents,
 	})
-	if err := s.bus.Publish(ctx, events.Event{
-		ID:         events.NewID(),
-		Type:       events.InvoiceFinalized,
-		CustomerID: customerID,
-		OccurredAt: time.Now().UTC(),
-		Payload:    payload,
-	}); err != nil {
-		return err
-	}
-	outcome := events.PaymentSucceeded
-	if !inv.Paid {
-		outcome = events.PaymentFailed
-	}
 	return s.bus.Publish(ctx, events.Event{
 		ID:         events.NewID(),
-		Type:       outcome,
+		Type:       t,
 		CustomerID: customerID,
 		OccurredAt: time.Now().UTC(),
 		Payload:    payload,
 	})
 }
 
-// addInvoiceItem creates a pending invoice item on the customer in Stripe (amount
-// in micros), including the metered quantity and unit price for an itemized line.
-func (s *Service) addInvoiceItem(ctx context.Context, customer string, amountMicros int64, currency, description string, quantity float64, unitPriceMicros int64) error {
+// addInvoiceItem creates an invoice item on a specific open draft invoice in Stripe
+// (amount in micros), including the metered quantity and unit price for an itemized
+// line. The item appears on that invoice when it finalizes.
+func (s *Service) addInvoiceItem(ctx context.Context, invoiceID, customer string, amountMicros int64, currency, description string, quantity float64, unitPriceMicros int64) error {
 	if err := s.postJSON(ctx, s.baseURL+"/v1/invoiceitems", map[string]any{
+		"invoice":           invoiceID,
 		"customer":          customer,
 		"amount_micros":     amountMicros,
 		"currency":          currency,
@@ -534,11 +508,14 @@ func (s *Service) deleteURL(ctx context.Context, url string) error {
 	return nil
 }
 
-// handleWebhook receives Stripe webhooks from fakestripe:
-//   - customer.subscription.created: mark the link record active, publish the fact.
-//   - invoice.upcoming: finalize the invoice for the subscription's ended (or, when
-//     final, partial) period — pulling that window's usage and billing it with the
-//     subscription fee. A final one also marks the record canceled.
+// handleWebhook receives Stripe webhooks from fakestripe, mirroring the real Stripe
+// invoice lifecycle:
+//   - customer.subscription.created/updated: sync the link record; publish the fact.
+//   - invoice.created: a draft invoice is open for a period — attach that window's
+//     usage to it, then finalize it (the auto_advance=false flow).
+//   - invoice.finalized: the invoice is immutable now — publish the fact; a final
+//     invoice also marks the link record canceled.
+//   - invoice.payment_succeeded / invoice.payment_failed: publish the outcome.
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.webhookSecret != "" && r.Header.Get("X-Webhook-Secret") != s.webhookSecret {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
@@ -555,6 +532,8 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 				Metadata         map[string]string `json:"metadata"`
 				CurrentPeriodEnd string            `json:"current_period_end"`
 				Period           int               `json:"period"`
+				AmountDue        int               `json:"amount_due"`
+				Paid             bool              `json:"paid"`
 			} `json:"object"`
 		} `json:"data"`
 		BillingPeriod struct {
@@ -570,77 +549,103 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	obj := evt.Data.Object
-
-	// Correlate to our link record by the metadata id set at create time, then the
-	// Stripe subscription id, then the customer (one container per customer).
-	s.subMu.Lock()
-	sub := s.subs[obj.Metadata["invoicing_subscription_id"]]
-	if sub == nil {
-		for _, candidate := range s.subs {
-			if candidate.StripeSubscriptionID == obj.ID {
-				sub = candidate
-				break
-			}
-		}
-	}
-	if sub == nil {
-		if id, ok := s.subByCustomer[obj.Customer]; ok {
-			sub = s.subs[id]
-		}
-	}
-	if sub == nil {
-		s.subMu.Unlock()
-		s.log.Error("webhook for unknown subscription", "type", evt.Type, "stripe_id", obj.ID)
-		w.WriteHeader(http.StatusOK) // ack so the provider doesn't retry forever
-		return
-	}
-	if sub.StripeSubscriptionID == "" {
-		sub.StripeSubscriptionID = obj.ID
-	}
-	// Sync the container's items + period from Stripe.
-	sub.Items = obj.Items
-	if obj.CurrentPeriodEnd != "" {
-		sub.CurrentPeriodEnd = obj.CurrentPeriodEnd
-		sub.Period = obj.Period
-	}
+	ctx := r.Context()
 
 	switch evt.Type {
-	case "customer.subscription.created":
-		sub.Status = "active"
-		record := *sub
-		s.subMu.Unlock()
-		s.publishSubscriptionFact(r.Context(), events.SubscriptionCreated, record)
-
-	case "customer.subscription.updated":
-		if obj.Status != "" {
-			sub.Status = obj.Status
+	case "customer.subscription.created", "customer.subscription.updated":
+		s.subMu.Lock()
+		sub := s.correlateLocked(obj.Metadata["invoicing_subscription_id"], obj.ID, obj.Customer)
+		if sub == nil {
+			s.subMu.Unlock()
+			s.log.Error("webhook for unknown subscription", "type", evt.Type, "stripe_id", obj.ID)
+			break // ack anyway so the provider doesn't retry forever
 		}
-		s.subMu.Unlock()
-
-	case "invoice.upcoming":
-		if evt.BillingPeriod.Final {
-			sub.Status = "canceled"
-			sub.Items = nil
+		if sub.StripeSubscriptionID == "" {
+			sub.StripeSubscriptionID = obj.ID
 		}
-		record := *sub
-		s.subMu.Unlock()
-		start, _ := time.Parse(time.RFC3339, evt.BillingPeriod.Start)
-		end, _ := time.Parse(time.RFC3339, evt.BillingPeriod.End)
-		if err := s.finalizeSubscriptionInvoice(r.Context(), record.CustomerID, record.StripeSubscriptionID,
-			start, end, evt.BillingPeriod.Period, evt.BillingPeriod.Final, evt.BillingPeriod.BillUsage); err != nil {
-			s.log.Error("finalize subscription invoice failed", "err", err)
+		sub.Items = obj.Items
+		if obj.CurrentPeriodEnd != "" {
+			sub.CurrentPeriodEnd = obj.CurrentPeriodEnd
+			sub.Period = obj.Period
 		}
-		if evt.BillingPeriod.Final {
-			s.publishSubscriptionFact(r.Context(), events.SubscriptionCancelled, record)
-			s.subMu.Lock()
-			delete(s.subByCustomer, record.CustomerID)
+		if evt.Type == "customer.subscription.created" {
+			sub.Status = "active"
+			record := *sub
+			s.subMu.Unlock()
+			s.publishSubscriptionFact(ctx, events.SubscriptionCreated, record)
+		} else {
+			if obj.Status != "" {
+				sub.Status = obj.Status
+			}
 			s.subMu.Unlock()
 		}
 
-	default:
-		s.subMu.Unlock()
+	case "invoice.created":
+		// obj is a draft invoice. Attach this window's usage, then finalize.
+		start, _ := time.Parse(time.RFC3339, evt.BillingPeriod.Start)
+		end, _ := time.Parse(time.RFC3339, evt.BillingPeriod.End)
+		if err := s.billOpenInvoice(ctx, obj.Customer, obj.ID, start, end, evt.BillingPeriod.Period, evt.BillingPeriod.BillUsage); err != nil {
+			s.log.Error("bill open invoice failed", "invoice", obj.ID, "err", err)
+		}
+
+	case "invoice.finalized":
+		if obj.AmountDue > 0 {
+			if err := s.publishInvoiceFact(ctx, events.InvoiceFinalized, obj.Customer, obj.ID, obj.Status, obj.AmountDue); err != nil {
+				s.log.Error("publish invoice.finalized failed", "err", err)
+			}
+		}
+		if evt.BillingPeriod.Final {
+			s.subMu.Lock()
+			var record Subscription
+			found := false
+			if id, ok := s.subByCustomer[obj.Customer]; ok {
+				if sub := s.subs[id]; sub != nil {
+					sub.Status = "canceled"
+					sub.Items = nil
+					record = *sub
+					found = true
+					delete(s.subByCustomer, obj.Customer)
+				}
+			}
+			s.subMu.Unlock()
+			if found {
+				s.publishSubscriptionFact(ctx, events.SubscriptionCancelled, record)
+			}
+		}
+
+	case "invoice.payment_succeeded":
+		if obj.AmountDue > 0 {
+			if err := s.publishInvoiceFact(ctx, events.PaymentSucceeded, obj.Customer, obj.ID, obj.Status, obj.AmountDue); err != nil {
+				s.log.Error("publish payment_succeeded failed", "err", err)
+			}
+		}
+
+	case "invoice.payment_failed":
+		if obj.AmountDue > 0 {
+			if err := s.publishInvoiceFact(ctx, events.PaymentFailed, obj.Customer, obj.ID, obj.Status, obj.AmountDue); err != nil {
+				s.log.Error("publish payment_failed failed", "err", err)
+			}
+		}
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// correlateLocked finds a customer's subscription link record by the metadata id set
+// at create time, then the Stripe subscription id, then the customer (one container
+// per customer). Caller must hold s.subMu.
+func (s *Service) correlateLocked(metaID, stripeID, customer string) *Subscription {
+	if sub := s.subs[metaID]; sub != nil {
+		return sub
+	}
+	for _, sub := range s.subs {
+		if sub.StripeSubscriptionID == stripeID {
+			return sub
+		}
+	}
+	if id, ok := s.subByCustomer[customer]; ok {
+		return s.subs[id]
+	}
+	return nil
 }
 
 // publishSubscriptionFact emits a subscription lifecycle event on the bus.
